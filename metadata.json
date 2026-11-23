@@ -1,0 +1,6 @@
+{
+  "name": "NeoQuant India — Kotak Neo Multi-Timeframe AI Bot",
+  "description": "Multi-tab NSE CDS & F&O automated trading system for Kotak Securities Neo API v2 with 4-timeframe live chart workspaces (30M, 5M, 1M, 30S), AI background scanner, 1-year indicator optimizer, and Oracle Autonomous DB persistence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
