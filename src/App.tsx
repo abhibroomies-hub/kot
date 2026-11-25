@@ -223,6 +223,7 @@ export default function App() {
   const equityRef = useRef<number>(liveAccount.equityInr);
   const botHydratedRef = useRef<boolean>(false);
   const lastServerBotActionRef = useRef<string | null>(null);
+  const kotakAlignedSymsRef = useRef<Set<TradingSymbol>>(new Set());
 
   useEffect(() => {
     tabsRef.current = tabs;
@@ -546,6 +547,9 @@ export default function App() {
         })
         .then((data) => {
           setQuadFetchError(null);
+          if (data.source === 'KOTAK_NEO_LIVE') {
+            kotakAlignedSymsRef.current.add(sym);
+          }
           const baseFrames: Record<QuadTimeframe, Candle[]> = {
             '30M': data.frames['30M'] ?? [],
             '5M': data.frames['5M'] ?? [],
@@ -952,7 +956,32 @@ export default function App() {
           if (!quote || typeof quote.mid !== 'number' || quote.mid <= 0) return;
 
           if (sym === activeTabRefValue()) setStreamStatus('LIVE');
+
+          // If initial quad load came from Spot fallback before Kotak quote arrived, refresh once to align basis
+          if (quote.source === 'KOTAK_NEO_LIVE' && !kotakAlignedSymsRef.current.has(sym)) {
+            kotakAlignedSymsRef.current.add(sym);
+            if (quadCandlesRef.current[sym]) {
+              delete quadCandlesRef.current[sym];
+              setQuadRefreshNonce((n) => n + 1);
+            }
+          }
+
+          const prevQuote = quotesRef.current[sym];
+          const unchangedClosedOrSameBucket =
+            Boolean(prevQuote) &&
+            prevQuote!.mid === quote.mid &&
+            prevQuote!.bid === quote.bid &&
+            prevQuote!.ask === quote.ask &&
+            prevQuote!.source === quote.source &&
+            prevQuote!.marketStatus === quote.marketStatus &&
+            prevQuote!.contractSymbol === quote.contractSymbol &&
+            (quote.marketStatus === 'NSE_CLOSED' ||
+              Math.floor(quote.ts / 30_000) === Math.floor(prevQuote!.ts / 30_000));
+
           quotesRef.current = { ...quotesRef.current, [sym]: quote };
+          if (unchangedClosedOrSameBucket) {
+            return;
+          }
           quotesDirty = true;
 
           const spec = INDIAN_SYMBOLS[sym];
@@ -960,18 +989,15 @@ export default function App() {
           const isVisibleSymbol = sym === activeTabRefValue();
           const anyBotArmed = tabsRef.current.some((t) => t.symbol === sym && t.autoBotActive);
 
-          // Update 4-TF candles in O(1) for the visible symbol or any symbol with an active Auto-Bot
+          // Update 4-TF candles in O(1) ONLY while exchange/global market is open (never create fake closed-market bars!)
           const curFrames = quadCandlesRef.current[sym];
           const matchingTab =
             tabsRef.current.find((t) => t.tabId === activeTabIdRef.current && t.symbol === sym) ??
             tabsRef.current.find((t) => t.symbol === sym);
 
-          const isAfterHoursFrozen =
-            quote.marketStatus === 'NSE_CLOSED' &&
-            curFrames?.['1M']?.length &&
-            Math.abs(curFrames['1M'][curFrames['1M'].length - 1].close - midPrice) < spec.tickSize * 0.5;
+          const isMarketClosed = quote.marketStatus === 'NSE_CLOSED';
 
-          if (curFrames && matchingTab && (isVisibleSymbol || anyBotArmed) && !isAfterHoursFrozen) {
+          if (curFrames && matchingTab && (isVisibleSymbol || anyBotArmed) && !isMarketClosed) {
             const nextFrames: Record<QuadTimeframe, Candle[]> = { ...curFrames };
             const updatedSignals: Partial<Record<QuadTimeframe, 'BUY' | 'SELL' | null>> = {};
 
@@ -1376,6 +1402,7 @@ export default function App() {
           setBrokerPositions(data.brokerPositions);
         }
         // Immediately auto-load all 4 real TradingView charts + live NSE quotes + Kotak orders
+        kotakAlignedSymsRef.current.clear();
         quadCandlesRef.current = {};
         setQuadCandlesBySymbol({});
         setQuadFetchError(null);
@@ -1457,6 +1484,7 @@ export default function App() {
           equityInr: 0,
         }));
       }
+      kotakAlignedSymsRef.current.clear();
       quadCandlesRef.current = {};
       quotesRef.current = {};
       liveTradesRef.current = [];

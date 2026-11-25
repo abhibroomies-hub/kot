@@ -346,6 +346,10 @@ async function startServer() {
 
   app.use(express.json({ limit: '5mb' }));
 
+  app.get('/favicon.ico', (_req, res) => {
+    res.status(204).end();
+  });
+
   app.get('/api/health', (_req, res) => {
     const db = oracleVault.getStatus();
     res.json({
@@ -787,6 +791,57 @@ async function startServer() {
     }
   }
 
+  /**
+   * Clamps isolated 1-bar OTC bad prints (e.g. Yahoo INR=X 94.27 spike surrounded by 92.22 bars)
+   * while preserving genuine multi-bar market trends without distortion.
+   */
+  function sanitizeCandles(candles: RealCandle[], decimals: number): RealCandle[] {
+    if (candles.length < 5) return candles;
+    const out: RealCandle[] = new Array(candles.length);
+    for (let i = 0; i < candles.length; i++) {
+      const c = candles[i];
+      const neighborCloses: number[] = [];
+      for (let d = -3; d <= 3; d++) {
+        if (d === 0) continue;
+        const idx = i + d;
+        if (idx >= 0 && idx < candles.length && candles[idx].close > 0) {
+          neighborCloses.push(candles[idx].close);
+        }
+      }
+      if (neighborCloses.length < 2) {
+        out[i] = c;
+        continue;
+      }
+      neighborCloses.sort((a, b) => a - b);
+      const med = neighborCloses[Math.floor(neighborCloses.length / 2)];
+      const neighborMin = neighborCloses[0];
+      const neighborMax = neighborCloses[neighborCloses.length - 1];
+      const neighborSpan = Math.abs(neighborMax - neighborMin);
+      const maxJump = Math.max(med * 0.0085, neighborSpan * 3.5);
+      const upperCap = Number((neighborMax + maxJump).toFixed(decimals));
+      const lowerCap = Number(Math.max(med * 0.5, neighborMin - maxJump).toFixed(decimals));
+
+      const open = Math.min(upperCap, Math.max(lowerCap, c.open));
+      const close = Math.min(upperCap, Math.max(lowerCap, c.close));
+      const bodyHi = Math.max(open, close);
+      const bodyLo = Math.min(open, close);
+      const wickAllowance = Math.max(med * 0.006, neighborSpan * 2.5);
+      const high = Number(Math.min(Math.max(c.high, bodyHi), bodyHi + wickAllowance).toFixed(decimals));
+      const low = Number(
+        Math.max(Math.min(c.low, bodyLo), Math.max(med * 0.5, bodyLo - wickAllowance)).toFixed(decimals)
+      );
+
+      out[i] = {
+        ...c,
+        open: Number(open.toFixed(decimals)),
+        high: Math.max(high, open, close),
+        low: Math.min(low, open, close),
+        close: Number(close.toFixed(decimals)),
+      };
+    }
+    return out;
+  }
+
   function aggregateCandles(candles: RealCandle[], bucketMs: number, decimals: number): RealCandle[] {
     if (candles.length === 0) return [];
     const out: RealCandle[] = [];
@@ -954,7 +1009,11 @@ async function startServer() {
     }
 
     const bucketMs = intervalToMs(interval);
-    const candles = bucketMs > 0 ? aggregateCandles(rawCandles, bucketMs, decimals) : rawCandles;
+    const cleanedRaw = sanitizeCandles(rawCandles, decimals);
+    const candles =
+      bucketMs > 0
+        ? sanitizeCandles(aggregateCandles(cleanedRaw, bucketMs, decimals), decimals)
+        : cleanedRaw;
 
     return {
       candles,
@@ -1140,10 +1199,14 @@ async function startServer() {
   const kotakContracts = new Map<TradingSymbol, KotakResolvedContract>();
 
   const kotakLiveCandles = new Map<TradingSymbol, Record<'30M' | '5M' | '1M' | '30S', RealCandle[]>>();
+  const kotakLastQuoteAt = new Map<TradingSymbol, number>();
+  const kotakBasisAligned = new Set<TradingSymbol>();
   let kotakScripMasterReady = false;
   let kotakScripMasterPromise: Promise<void> | null = null;
 
   function recordKotakLiveTickBar(sym: TradingSymbol, price: number, tsMs: number) {
+    // Strictly never synthesize new candles when the Indian exchange segment is closed!
+    if (!isNseMarketOpen(sym, tsMs)) return;
     const decimals = SYMBOL_FEED_MAP[sym].decimals;
     const rounded = Number(price.toFixed(decimals));
     let bucketMap = kotakLiveCandles.get(sym);
@@ -1188,11 +1251,11 @@ async function startServer() {
     decimals: number
   ): RealCandle[] {
     let base = historical;
-    // If Kotak Neo Futures LTP differs slightly from Spot (futures basis), shift historical curve by constant futures basis
+    // Align historical spot/global parity curve smoothly to Kotak Neo Futures/MCX contract LTP (eliminates step cliffs)
     if (kotakLtp && kotakLtp > 0 && base.length > 0) {
       const lastClose = base[base.length - 1].close;
       const basisPct = Math.abs(kotakLtp - lastClose) / lastClose;
-      if (basisPct > 0.0002 && basisPct < 0.04) {
+      if (basisPct > 0.0001 && basisPct < 0.35) {
         const ratio = kotakLtp / lastClose;
         base = base.map((c) => ({
           ...c,
@@ -1549,10 +1612,15 @@ async function startServer() {
       const candles30S = expand1mTo30sCandles(candles1M.slice(-110), meta.decimals);
 
       // If Kotak Neo Live session is authenticated & has a real quote for this symbol, align basis + overlay live Kotak bars
+      const nseOpen = isNseMarketOpen(sym);
       const liveKotakQuote = latestStreamQuotes.get(sym);
-      const isKotakFeed = Boolean(liveBrokerSession && liveKotakQuote?.source === 'KOTAK_NEO_LIVE');
+      const isKotakFeed = Boolean(
+        liveBrokerSession &&
+          liveKotakQuote?.source === 'KOTAK_NEO_LIVE' &&
+          (nseOpen || !meta.is24x5Global)
+      );
       const kotakLtp = isKotakFeed ? liveKotakQuote?.mid : undefined;
-      const liveBars = kotakLiveCandles.get(sym);
+      const liveBars = isKotakFeed ? kotakLiveCandles.get(sym) : undefined;
       const contractSymbol = kotakContracts.get(sym)?.trdSymbol;
 
       const final30M = mergeHistoricalWithKotakBars(candles30M, liveBars?.['30M'], kotakLtp, meta.decimals);
@@ -1560,7 +1628,6 @@ async function startServer() {
       const final1M = mergeHistoricalWithKotakBars(candles1M, liveBars?.['1M'], kotakLtp, meta.decimals);
       const final30S = mergeHistoricalWithKotakBars(candles30S, liveBars?.['30S'], kotakLtp, meta.decimals);
 
-      const nseOpen = isNseMarketOpen(sym);
       const marketStatus: QuadPayload['marketStatus'] = nseOpen
         ? 'NSE_LIVE'
         : meta.is24x5Global
@@ -1718,15 +1785,13 @@ async function startServer() {
           if (msg.channel === 'ticker' && Array.isArray(msg.data)) {
             const usdinr = cachedUsdInrRate.rate;
             const now = Date.now();
-            const isFreshKotak = (s: TradingSymbol) => {
-              const prev = latestStreamQuotes.get(s);
-              return Boolean(
+            const isFreshKotak = (s: TradingSymbol) =>
+              Boolean(
                 liveBrokerSession &&
-                  prev?.source === 'KOTAK_NEO_LIVE' &&
-                  now - prev.ts < 5000 &&
-                  isNseMarketOpen(s, now)
+                  isNseMarketOpen(s, now) &&
+                  (kotakContracts.has(s) || Boolean(KOTAK_SPOT_QUOTE_TOKENS[s])) &&
+                  now - (kotakLastQuoteAt.get(s) ?? 0) < 25_000
               );
-            };
             for (const item of msg.data) {
               if (item.symbol === 'EUR/USD' && typeof item.bid === 'number' && typeof item.ask === 'number') {
                 if (!isFreshKotak('EURUSD')) {
@@ -1826,8 +1891,24 @@ async function startServer() {
   async function pollKotakNeoLiveQuotes(activeSyms: TradingSymbol[]): Promise<Set<TradingSymbol>> {
     const handled = new Set<TradingSymbol>();
     if (!liveBrokerSession || activeSyms.length === 0) return handled;
-    if (Date.now() - lastKotakQuotePollAt < 650) return handled;
-    lastKotakQuotePollAt = Date.now();
+
+    const nowTs = Date.now();
+    const markRecentlyHandled = () => {
+      for (const s of activeSyms) {
+        const meta = SYMBOL_FEED_MAP[s];
+        const openNow = isNseMarketOpen(s, nowTs);
+        // Never allow fallback Spot/Yahoo feeds to overwrite a recently-fetched Kotak contract quote!
+        if ((openNow || !meta.is24x5Global) && nowTs - (kotakLastQuoteAt.get(s) ?? 0) < 25_000) {
+          handled.add(s);
+        }
+      }
+    };
+
+    if (nowTs - lastKotakQuotePollAt < 700) {
+      markRecentlyHandled();
+      return handled;
+    }
+    lastKotakQuotePollAt = nowTs;
 
     const queryItems: Array<{
       sym: TradingSymbol;
@@ -1836,6 +1917,18 @@ async function startServer() {
       tokenStr: string;
     }> = [];
     for (const sym of activeSyms) {
+      const meta = SYMBOL_FEED_MAP[sym];
+      const openNow = isNseMarketOpen(sym, nowTs);
+      // After NSE Currency closes (5:00 PM IST), let 24x5 global crosses run freely without frozen 5 PM Kotak quotes
+      if (!openNow && meta.is24x5Global) {
+        continue;
+      }
+      // For closed NSE-only markets (USDINR, NIFTY50, BANKNIFTY), refresh closing quote once every 15s and hold steady
+      if (!openNow && !meta.is24x5Global && nowTs - (kotakLastQuoteAt.get(sym) ?? 0) < 15_000) {
+        handled.add(sym);
+        continue;
+      }
+
       const c = kotakContracts.get(sym);
       const spot = KOTAK_SPOT_QUOTE_TOKENS[sym];
       if (c) {
@@ -1854,7 +1947,10 @@ async function startServer() {
         });
       }
     }
-    if (queryItems.length === 0) return handled;
+    if (queryItems.length === 0) {
+      markRecentlyHandled();
+      return handled;
+    }
 
     const t0 = Date.now();
     try {
@@ -1870,7 +1966,10 @@ async function startServer() {
         },
         signal: AbortSignal.timeout(3500),
       });
-      if (!resp.ok) return handled;
+      if (!resp.ok) {
+        markRecentlyHandled();
+        return handled;
+      }
       const rows = (await resp.json().catch(() => null)) as Array<{
         exchange_token?: string;
         display_symbol?: string;
@@ -1881,7 +1980,10 @@ async function startServer() {
           sell?: Array<{ price?: string | number }>;
         };
       }> | null;
-      if (!Array.isArray(rows)) return handled;
+      if (!Array.isArray(rows)) {
+        markRecentlyHandled();
+        return handled;
+      }
       const lat = Math.max(4, Date.now() - t0);
       const now = Date.now();
 
@@ -1908,25 +2010,47 @@ async function startServer() {
         );
         const mid = Number(ltp.toFixed(spec.decimals));
         const nseOpen = isNseMarketOpen(matched.sym, now);
+        const contractSym = kotakContracts.get(matched.sym)?.trdSymbol || row.display_symbol || matched.displayHint;
 
-        recordKotakLiveTickBar(matched.sym, mid, now);
-        broadcastTick({
-          symbol: matched.sym,
-          bid,
-          ask,
-          mid,
-          spreadTicks: Number(Math.max(1, (ask - bid) / spec.tickSize).toFixed(1)),
-          source: 'KOTAK_NEO_LIVE',
-          latencyMs: lat,
-          ts: now,
-          contractSymbol: row.display_symbol || matched.displayHint,
-          marketStatus: nseOpen ? 'NSE_LIVE' : 'NSE_CLOSED',
-        });
+        kotakLastQuoteAt.set(matched.sym, now);
+        if (!kotakBasisAligned.has(matched.sym)) {
+          kotakBasisAligned.add(matched.sym);
+          quadCache.delete(matched.sym);
+        }
+
+        if (nseOpen) {
+          recordKotakLiveTickBar(matched.sym, mid, now);
+        }
+
+        const prevQuote = latestStreamQuotes.get(matched.sym);
+        const shouldEmit =
+          nseOpen ||
+          !prevQuote ||
+          prevQuote.source !== 'KOTAK_NEO_LIVE' ||
+          prevQuote.mid !== mid ||
+          prevQuote.contractSymbol !== contractSym ||
+          now - prevQuote.ts >= 15_000;
+
+        if (shouldEmit) {
+          broadcastTick({
+            symbol: matched.sym,
+            bid,
+            ask,
+            mid,
+            spreadTicks: Number(Math.max(1, (ask - bid) / spec.tickSize).toFixed(1)),
+            source: 'KOTAK_NEO_LIVE',
+            latencyMs: lat,
+            ts: now,
+            contractSymbol: contractSym,
+            marketStatus: nseOpen ? 'NSE_LIVE' : 'NSE_CLOSED',
+          });
+        }
         handled.add(matched.sym);
       }
     } catch {
-      // Fall back smoothly to institutional global/NSE feed if Kotak quotes endpoint times out
+      // Retain recently-handled Kotak symbols so a transient timeout never causes a 1-tick Spot jump
     }
+    markRecentlyHandled();
     return handled;
   }
 
@@ -2107,7 +2231,7 @@ async function startServer() {
       lastHeadlessPumpTs = Date.now();
       void pumpActiveFeeds();
     }
-  }, 350);
+  }, 750);
 
   app.get('/api/market/stream', (req, res) => {
     const rawSym = String(req.query.symbol || 'USDINR').toUpperCase() as TradingSymbol;
@@ -2353,6 +2477,10 @@ async function startServer() {
     liveBrokerSession = null;
     kotakScripMasterReady = false;
     kotakContracts.clear();
+    kotakLastQuoteAt.clear();
+    kotakBasisAligned.clear();
+    kotakLiveCandles.clear();
+    latestStreamQuotes.clear();
     latestBrokerOrders = [];
     latestBrokerPositions = [];
     quadCache.clear();
@@ -2688,6 +2816,10 @@ async function startServer() {
       // Fetch real Kotak margin limits + bootstrap Scrip Master + reconcile real Kotak positions/orders
       quadCache.clear();
       kotakContracts.clear();
+      kotakLastQuoteAt.clear();
+      kotakBasisAligned.clear();
+      kotakLiveCandles.clear();
+      lastKotakQuotePollAt = 0;
       const [fetchedMargin] = await Promise.all([
         fetchKotakLiveMarginDetails(liveBrokerSession),
         Promise.race([
@@ -2696,16 +2828,19 @@ async function startServer() {
         ]),
         reconcileWithKotakBrokerBook(liveBrokerSession),
       ]);
-      void pollKotakNeoLiveQuotes([
+      await pollKotakNeoLiveQuotes([
         'USDINR',
         'EURINR',
         'GBPINR',
         'JPYINR',
         'GOLDPETAL',
         'GOLDM',
+        'SILVERMIC',
+        'CRUDEOILM',
         'NIFTY50',
         'BANKNIFTY',
       ]);
+      quadCache.clear();
 
       const liveBalanceInr = fetchedMargin?.availableInr ?? 0;
       const liveUsedMarginInr = fetchedMargin?.usedMarginInr ?? 0;
@@ -2935,8 +3070,11 @@ async function startServer() {
 
   app.get('/api/kotak/orders', async (_req, res) => {
     if (!liveBrokerSession || vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED') {
-      res.status(401).json({
-        error: 'Kotak Neo LIVE session active nahi hai. Pehle Kotak account login karein.',
+      res.status(200).json({
+        success: false,
+        connected: false,
+        orders: [],
+        positions: [],
       });
       return;
     }

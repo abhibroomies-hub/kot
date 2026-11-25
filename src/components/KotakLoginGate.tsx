@@ -197,7 +197,7 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
                   id="gate-kotak-key"
                   name="consumerKey"
                   type="password"
-                  autoComplete="off"
+                  autoComplete="new-password"
                   value={consumerKey}
                   onChange={(e) => setConsumerKey(e.target.value)}
                   placeholder="Kotak Neo Trade API Dashboard se mila Access Token paste karein"
