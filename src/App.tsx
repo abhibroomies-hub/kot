@@ -31,10 +31,10 @@ import {
   evaluateMultiTimeframeConfluence,
   formatInr,
   generateOneYearHistoricalData,
+  getDefaultSlotConfig,
   parseCustomCsvCandles,
   runBacktestOnCandles,
   runOneYearTestAndAutoFix,
-  timeframeToMs,
 } from './engine/backtestEngine';
 import { QuadChartCell } from './components/QuadChartCell';
 import { HistoricalChartCanvas } from './components/HistoricalChartCanvas';
@@ -204,7 +204,8 @@ export default function App() {
   const riskConfigRef = useRef<RiskConfig>(riskConfig);
   const quotesRef = useRef<Partial<Record<TradingSymbol, LiveMarketQuote>>>(quotesBySymbol);
   const equityRef = useRef<number>(liveAccount.equityInr);
-  const lastBotBarBucketRef = useRef<Record<string, number>>({});
+  const botHydratedRef = useRef<boolean>(false);
+  const lastServerBotActionRef = useRef<string | null>(null);
 
   useEffect(() => {
     tabsRef.current = tabs;
@@ -237,7 +238,55 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  // Load Kotak Neo Live Session Status + AI Strategy Memory Vault on Mount
+  const mapServerTradesToUi = useCallback((rawList: unknown[]): LiveBotTrade[] => {
+    return rawList
+      .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && (item as Record<string, unknown>).brokerMode === 'LIVE'))
+      .map((t) => {
+        const sym = t.symbol as TradingSymbol;
+        const spec = INDIAN_SYMBOLS[sym];
+        const dir = (t.direction === 'SELL' ? 'SELL' : 'BUY') as 'BUY' | 'SELL';
+        const isOpen = (t.status as LiveBotTrade['status']) === 'OPEN';
+        const q = quotesRef.current[sym];
+        const liveMark =
+          isOpen && q && spec
+            ? Number((dir === 'BUY' ? q.bid : q.ask).toFixed(spec.decimals))
+            : Number(t.exitPrice ?? t.entryPrice) || 0;
+        const entry = Number(t.entryPrice) || 0;
+        const lots = Number(t.lots) || 1;
+        const diff = dir === 'BUY' ? liveMark - entry : entry - liveMark;
+        const pnlTicks =
+          isOpen && spec ? Number((diff / spec.tickSize).toFixed(1)) : Number(t.pnlTicks) || 0;
+        const pnlInr =
+          isOpen && spec
+            ? Number((pnlTicks * spec.valuePerTickInr * lots).toFixed(2))
+            : Number(t.pnlInr) || 0;
+
+        return {
+          id: String(t.id),
+          symbol: sym,
+          direction: dir,
+          lots,
+          entryPrice: entry,
+          currentPrice: liveMark,
+          stopLoss: Number(t.stopLoss) || 0,
+          takeProfit: Number(t.takeProfit) || 0,
+          initialStopDistance:
+            typeof t.initialStopDistance === 'number' ? t.initialStopDistance : undefined,
+          breakEvenLocked: Boolean(t.breakEvenLocked),
+          trailingActivated: Boolean(t.trailingActivated),
+          pnlInr,
+          pnlTicks,
+          openedAt: new Date(Number(t.ts) || Date.now()).toLocaleTimeString(),
+          status: (t.status as LiveBotTrade['status']) || 'OPEN',
+          brokerMode: 'LIVE' as BrokerMode,
+          strategyUsed: (t.strategyUsed as StrategyArchetype) || 'EMA_RSI_CONFLUENCE',
+          confluenceNote: t.confluenceNote ? String(t.confluenceNote) : undefined,
+          brokerOrderId: t.brokerOrderId ? String(t.brokerOrderId) : undefined,
+        };
+      });
+  }, []);
+
+  // Load Kotak Neo Live Session Status + 24x7 Server Bot Config + AI Strategy Memory Vault on Mount
   useEffect(() => {
     fetch('/api/kotak/status')
       .then((r) => (r.ok ? r.json() : null))
@@ -253,10 +302,70 @@ export default function App() {
             data.accounts.LIVE.sessionState === 'NEO_LIVE_AUTHENTICATED'
           ) {
             setStatusNotice(
-              `Kotak Neo LIVE Connected (UCC ${data.accounts.LIVE.ucc}) · Live NSE Feed Active`
+              `Kotak Neo LIVE Connected (UCC ${data.accounts.LIVE.ucc}) · 24×7 Oracle Server Ready`
             );
             syncKotakOrderBook();
           }
+        }
+        if (data.botRiskConfig && typeof data.botRiskConfig === 'object') {
+          setRiskConfig((prev) => ({
+            ...prev,
+            riskPerTradePct:
+              typeof data.botRiskConfig.riskPerTradePct === 'number'
+                ? data.botRiskConfig.riskPerTradePct
+                : prev.riskPerTradePct,
+            maxDailyDrawdownPct:
+              typeof data.botRiskConfig.maxDailyDrawdownPct === 'number'
+                ? data.botRiskConfig.maxDailyDrawdownPct
+                : prev.maxDailyDrawdownPct,
+            leverage: ([1, 5, 10, 20, 35].includes(Number(data.botRiskConfig.leverage))
+              ? Number(data.botRiskConfig.leverage)
+              : prev.leverage) as RiskConfig['leverage'],
+            trailingStopEnabled:
+              typeof data.botRiskConfig.trailingStopEnabled === 'boolean'
+                ? data.botRiskConfig.trailingStopEnabled
+                : prev.trailingStopEnabled,
+            breakEvenTriggerR:
+              typeof data.botRiskConfig.breakEvenTriggerR === 'number'
+                ? data.botRiskConfig.breakEvenTriggerR
+                : prev.breakEvenTriggerR,
+          }));
+        }
+        if (Array.isArray(data.armedSymbols)) {
+          const armedSet = new Set<TradingSymbol>(
+            data.armedSymbols.filter(
+              (s: unknown): s is TradingSymbol =>
+                typeof s === 'string' && Boolean(INDIAN_SYMBOLS[s as TradingSymbol])
+            )
+          );
+          setTabs((prev) => {
+            const next = prev.map((t) => ({
+              ...t,
+              autoBotActive: armedSet.has(t.symbol),
+            }));
+            const existingSyms = new Set(next.map((t) => t.symbol));
+            armedSet.forEach((sym) => {
+              if (!existingSyms.has(sym) && next.length < 6) {
+                next.push({
+                  tabId: `tab-${sym.toLowerCase()}`,
+                  title: sym,
+                  symbol: sym,
+                  autoBotActive: true,
+                  aiAutoAdaptAll: true,
+                  slots: {
+                    '30M': getDefaultSlotConfig('30M', sym),
+                    '5M': getDefaultSlotConfig('5M', sym),
+                    '1M': getDefaultSlotConfig('1M', sym),
+                    '30S': getDefaultSlotConfig('30S', sym),
+                  },
+                });
+              }
+            });
+            return next;
+          });
+        }
+        if (typeof data.lastBotAction === 'string' && data.lastBotAction) {
+          lastServerBotActionRef.current = data.lastBotAction;
         }
         if (data.kotakContracts && typeof data.kotakContracts === 'object') {
           setKotakContracts(data.kotakContracts);
@@ -269,35 +378,84 @@ export default function App() {
           setOracleDb(data.oracleDb);
         }
         if (Array.isArray(data.liveTrades)) {
-          const mapped: LiveBotTrade[] = data.liveTrades
-            .filter((t: Record<string, unknown>) => t.brokerMode === 'LIVE')
-            .map((t: Record<string, unknown>) => ({
-              id: String(t.id),
-              symbol: t.symbol as TradingSymbol,
-              direction: (t.direction === 'SELL' ? 'SELL' : 'BUY') as 'BUY' | 'SELL',
-              lots: Number(t.lots) || 1,
-              entryPrice: Number(t.entryPrice) || 0,
-              currentPrice: Number(t.exitPrice ?? t.entryPrice) || 0,
-              stopLoss: Number(t.stopLoss) || 0,
-              takeProfit: Number(t.takeProfit) || 0,
-              pnlInr: Number(t.pnlInr) || 0,
-              pnlTicks: Number(t.pnlTicks) || 0,
-              openedAt: new Date(Number(t.ts) || Date.now()).toLocaleTimeString(),
-              status: (t.status as LiveBotTrade['status']) || 'OPEN',
-              brokerMode: 'LIVE' as BrokerMode,
-              strategyUsed: (t.strategyUsed as StrategyArchetype) || 'EMA_RSI_CONFLUENCE',
-              confluenceNote: t.confluenceNote ? String(t.confluenceNote) : undefined,
-              brokerOrderId: t.brokerOrderId ? String(t.brokerOrderId) : undefined,
-            }));
+          const mapped = mapServerTradesToUi(data.liveTrades);
           liveTradesRef.current = mapped;
           setLiveTrades(mapped);
         }
       })
       .catch(() => {})
       .finally(() => {
+        botHydratedRef.current = true;
         setAuthChecked(true);
       });
-  }, [syncKotakOrderBook]);
+  }, [mapServerTradesToUi, syncKotakOrderBook]);
+
+  // Sync Armed 24x7 Bot Symbols + Risk Settings to Oracle Server
+  const armedSymbolsKey = useMemo(
+    () =>
+      Array.from(new Set(tabs.filter((t) => t.autoBotActive).map((t) => t.symbol)))
+        .sort()
+        .join(','),
+    [tabs]
+  );
+
+  useEffect(() => {
+    if (!botHydratedRef.current) return;
+    const armedSymbols = armedSymbolsKey
+      ? (armedSymbolsKey.split(',').filter(Boolean) as TradingSymbol[])
+      : [];
+    fetch('/api/bot/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        armedSymbols,
+        riskConfig: {
+          riskPerTradePct: riskConfig.riskPerTradePct,
+          maxDailyDrawdownPct: riskConfig.maxDailyDrawdownPct,
+          leverage: riskConfig.leverage,
+          trailingStopEnabled: riskConfig.trailingStopEnabled,
+          breakEvenTriggerR: riskConfig.breakEvenTriggerR,
+        },
+      }),
+    }).catch(() => {});
+  }, [armedSymbolsKey, riskConfig]);
+
+  // Poll 24x7 Server Trade Ledger, Trailing Stops & AI Memory every 4s while logged in
+  useEffect(() => {
+    if (!isKotakLoggedIn) return;
+    const timer = setInterval(() => {
+      fetch('/api/kotak/status')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (!data) return;
+          if (data.accounts?.LIVE) {
+            setLiveAccount(data.accounts.LIVE);
+          }
+          if (Array.isArray(data.aiMemory)) {
+            setAiMemory(data.aiMemory);
+            aiMemoryRef.current = data.aiMemory;
+          }
+          if (data.oracleDb && typeof data.oracleDb === 'object') {
+            setOracleDb(data.oracleDb);
+          }
+          if (Array.isArray(data.liveTrades)) {
+            const mapped = mapServerTradesToUi(data.liveTrades);
+            liveTradesRef.current = mapped;
+            setLiveTrades(mapped);
+          }
+          if (
+            typeof data.lastBotAction === 'string' &&
+            data.lastBotAction &&
+            data.lastBotAction !== lastServerBotActionRef.current
+          ) {
+            lastServerBotActionRef.current = data.lastBotAction;
+            setStatusNotice(data.lastBotAction);
+          }
+        })
+        .catch(() => {});
+    }, 4000);
+    return () => clearInterval(timer);
+  }, [isKotakLoggedIn, mapServerTradesToUi]);
 
   // Load 4-Timeframe Real Quad Candles (30M, 5M, 1M, 30S) ONLY AFTER Kotak Neo LIVE Login
   const openSymbolsKey = useMemo(
@@ -790,48 +948,11 @@ export default function App() {
             quadCandlesRef.current = { ...quadCandlesRef.current, [sym]: nextFrames };
             if (isVisibleSymbol) framesDirty = true;
             pendingSignalsBySym[sym] = updatedSignals;
-
-            // Check Multi-Timeframe Confluence Auto-Execution if Bot is armed on any tab using this symbol
-            if (anyBotArmed) {
-              tabsRef.current.forEach((t) => {
-                if (!t.autoBotActive || t.symbol !== sym) return;
-                const nextSlots = { ...t.slots };
-                QUAD_FRAMES.forEach((tf) => {
-                  nextSlots[tf] = {
-                    ...nextSlots[tf],
-                    liveSignal: updatedSignals[tf] ?? nextSlots[tf].liveSignal,
-                  };
-                });
-                const confluence = evaluateMultiTimeframeConfluence(nextSlots);
-                const hasOpenTrade = liveTradesRef.current.some(
-                  (tr) => tr.status === 'OPEN' && tr.symbol === sym
-                );
-                const barBucket = Math.floor(quote.ts / timeframeToMs('1M'));
-                if (
-                  confluence.direction !== 'WAIT' &&
-                  confluence.confidencePct >= 62 &&
-                  !hasOpenTrade &&
-                  lastBotBarBucketRef.current[t.tabId] !== barBucket
-                ) {
-                  lastBotBarBucketRef.current[t.tabId] = barBucket;
-                  placeKotakOrder(sym, confluence.direction, quote, confluence.summary);
-                }
-              });
-            }
           }
 
           scheduleUiFlush();
 
-          // Mark-to-Market Open Trades + Break-Even + Trailing SL + Auto TP/SL Exit
-          const closures: Array<{
-            id: string;
-            exitPrice: number;
-            pnlInr: number;
-            pnlTicks: number;
-            status: 'CLOSED_TP' | 'CLOSED_SL';
-            brokerMode: BrokerMode;
-          }> = [];
-
+          // Live Mark-to-Market display update (24x7 Server Engine handles actual Confluence Entry + Trailing SL/TP Exit)
           let touchedOpen = false;
           const nextTrades = liveTradesRef.current.map((tr) => {
             if (tr.status !== 'OPEN' || tr.symbol !== sym) return tr;
@@ -840,92 +961,8 @@ export default function App() {
             const diff = tr.direction === 'BUY' ? markPrice - tr.entryPrice : tr.entryPrice - markPrice;
             const pnlTicks = Number((diff / spec.tickSize).toFixed(1));
             const pnlInr = Number((pnlTicks * spec.valuePerTickInr * tr.lots).toFixed(2));
-
-            let nextSl = tr.stopLoss;
-            let nextBe = Boolean(tr.breakEvenLocked);
-            let nextTrail = Boolean(tr.trailingActivated);
-            const initDist = tr.initialStopDistance ?? Math.abs(tr.entryPrice - tr.stopLoss);
-
-            if (riskConfigRef.current.trailingStopEnabled && initDist > 0) {
-              if (diff >= initDist * Math.max(1.1, riskConfigRef.current.breakEvenTriggerR)) {
-                const beLevel =
-                  tr.direction === 'BUY'
-                    ? tr.entryPrice + initDist * 0.15
-                    : tr.entryPrice - initDist * 0.15;
-                const trailLevel =
-                  diff >= initDist * 1.5
-                    ? tr.direction === 'BUY'
-                      ? markPrice - initDist * 1.1
-                      : markPrice + initDist * 1.1
-                    : beLevel;
-                const cand =
-                  tr.direction === 'BUY'
-                    ? Math.max(beLevel, trailLevel)
-                    : Math.min(beLevel, trailLevel);
-                if (
-                  (tr.direction === 'BUY' && cand > nextSl) ||
-                  (tr.direction === 'SELL' && cand < nextSl)
-                ) {
-                  nextSl = Number(cand.toFixed(spec.decimals));
-                  nextBe = true;
-                  nextTrail = diff >= initDist * 1.5;
-                }
-              }
-            }
-
-            if (
-              (tr.direction === 'BUY' && markPrice >= tr.takeProfit) ||
-              (tr.direction === 'SELL' && markPrice <= tr.takeProfit)
-            ) {
-              closures.push({
-                id: tr.id,
-                exitPrice: markPrice,
-                pnlInr,
-                pnlTicks,
-                status: 'CLOSED_TP',
-                brokerMode: tr.brokerMode,
-              });
-              return {
-                ...tr,
-                stopLoss: nextSl,
-                breakEvenLocked: nextBe,
-                trailingActivated: nextTrail,
-                currentPrice: markPrice,
-                pnlTicks,
-                pnlInr,
-                status: 'CLOSED_TP' as const,
-              };
-            }
-
-            if (
-              (tr.direction === 'BUY' && markPrice <= nextSl) ||
-              (tr.direction === 'SELL' && markPrice >= nextSl)
-            ) {
-              closures.push({
-                id: tr.id,
-                exitPrice: markPrice,
-                pnlInr,
-                pnlTicks,
-                status: 'CLOSED_SL',
-                brokerMode: tr.brokerMode,
-              });
-              return {
-                ...tr,
-                stopLoss: nextSl,
-                breakEvenLocked: nextBe,
-                trailingActivated: nextTrail,
-                currentPrice: markPrice,
-                pnlTicks,
-                pnlInr,
-                status: 'CLOSED_SL' as const,
-              };
-            }
-
             return {
               ...tr,
-              stopLoss: nextSl,
-              breakEvenLocked: nextBe,
-              trailingActivated: nextTrail,
               currentPrice: markPrice,
               pnlTicks,
               pnlInr,
@@ -935,25 +972,6 @@ export default function App() {
           if (touchedOpen) {
             liveTradesRef.current = nextTrades;
             setLiveTrades(nextTrades);
-            for (const c of closures) {
-              settleBalanceInr(c.brokerMode, c.pnlInr);
-              fetch('/api/kotak/close', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(c),
-              })
-                .then((r) => (r.ok ? r.json() : null))
-                .then((data) => {
-                  if (Array.isArray(data?.aiMemory)) {
-                    setAiMemory(data.aiMemory);
-                    aiMemoryRef.current = data.aiMemory;
-                  }
-                  if (data?.aiEvolutionNote) {
-                    setStatusNotice(`AI Self-Learned: ${data.aiEvolutionNote}`);
-                  }
-                })
-                .catch(() => {});
-            }
           }
         } catch {
           // ignore frame parse issues
@@ -966,7 +984,7 @@ export default function App() {
       if (flushTimer) clearTimeout(flushTimer);
       sources.forEach((es) => es.close());
     };
-  }, [isKotakLoggedIn, openSymbolsKey, placeKotakOrder, settleBalanceInr]);
+  }, [isKotakLoggedIn, openSymbolsKey]);
 
   // Background AI Market Scanner Poll (feeds Right Auto-Hide Edge Widget)
   const handlePromoteScannerOpportunity = useCallback(
@@ -1179,7 +1197,16 @@ export default function App() {
 
   const handleToggleTabBot = (tabId: string) => {
     setTabs((prev) =>
-      prev.map((t) => (t.tabId === tabId ? { ...t, autoBotActive: !t.autoBotActive } : t))
+      prev.map((t) => {
+        if (t.tabId !== tabId) return t;
+        const nextActive = !t.autoBotActive;
+        setStatusNotice(
+          nextActive
+            ? `24×7 Server Auto-Bot ON for ${t.symbol} — PC/Browser band hone par bhi Oracle Server khud trade & SL/TP karega`
+            : `24×7 Server Auto-Bot OFF for ${t.symbol}`
+        );
+        return { ...t, autoBotActive: nextActive };
+      })
     );
   };
 
@@ -1567,12 +1594,12 @@ export default function App() {
             {activeTab.autoBotActive ? (
               <>
                 <Square className="w-3 h-3" />
-                Stop Bot
+                Stop 24×7 Bot
               </>
             ) : (
               <>
                 <Play className="w-3 h-3" />
-                Start {activeSymbol} Bot
+                Start 24×7 {activeSymbol} Bot
               </>
             )}
           </button>
