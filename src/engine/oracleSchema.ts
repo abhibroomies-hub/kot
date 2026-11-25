@@ -155,8 +155,9 @@ else
   cd /opt/kot && git pull
 fi
 cd /opt/kot
-NODE_OPTIONS="--max-old-space-size=1536" npm install
+NODE_OPTIONS="--max-old-space-size=1536" npm install --legacy-peer-deps
 NODE_OPTIONS="--max-old-space-size=1536" npm run build
+npx esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=server.js
 
 # STEP 5: Create .env file (Add Oracle Wallet / Gemini vars later if needed)
 if [ ! -f /opt/kot/.env ]; then
