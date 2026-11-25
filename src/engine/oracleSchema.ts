@@ -118,56 +118,88 @@ export async function upsertAiStrategyMemory(rec: AiStrategyMemoryRecord) {
 `;
 
 export const ORACLE_CLOUD_24X7_DEPLOY_SCRIPT = `#!/usr/bin/env bash
+set -e
 # ============================================================================
 # NeoQuant 24x7 Always-On Deployment Script for Oracle Cloud (OCI Free Tier)
-# Hardware: Oracle Always-Free Ampere A1 (4 OCPU, 24 GB RAM, Ubuntu 22.04/24.04)
-# Database: Oracle Autonomous Database 23ai Free (20 GB) + mTLS Wallet
+# Supports: VM.Standard.E2.1.Micro (1 GB RAM) & Ampere A1 (Ubuntu 22.04/24.04)
+# Public IP: 130.210.54.23 | Repo: https://github.com/abhibroomies-hub/kot.git
 # ============================================================================
 
-# STEP 1: System update + Node.js 20 LTS + PM2 Process Manager (24x7 Auto-Restart)
-sudo apt update && sudo apt upgrade -y
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt install -y nodejs git nginx certbot python3-certbot-nginx unzip
-sudo npm install -g pm2 tsx
+# STEP 1: Create 2 GB Swap File (Essential for 1 GB RAM VM.Standard.E2.1.Micro during Vite build)
+if [ ! -f /swapfile ]; then
+  sudo fallocate -l 2G /swapfile
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile
+  sudo swapon /swapfile
+  echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+fi
 
-# STEP 2: Open HTTP/HTTPS/3000 ports on OCI Ubuntu Firewall (Also allow 80, 443 in OCI VCN Security List!)
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
-sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 3000 -j ACCEPT
+# STEP 2: Install Node.js 22 LTS (Required for Vite 8 + Native WebSocket) + PM2 + Nginx
+sudo apt update -y
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo DEBIAN_FRONTEND=noninteractive apt install -y nodejs git nginx unzip iptables-persistent
+sudo npm install -g pm2
+
+# STEP 3: Open HTTP (80), HTTPS (443) & App (3000) ports on OCI Ubuntu Firewall
+sudo iptables -I INPUT 1 -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 1 -p tcp --dport 443 -j ACCEPT
+sudo iptables -I INPUT 1 -p tcp --dport 3000 -j ACCEPT
 sudo netfilter-persistent save || true
 
-# STEP 3: Clone your NeoQuant project & install dependencies + Oracle DB driver
-git clone https://github.com/<YOUR_USER>/neoquant-kotak.git /opt/neoquant
-cd /opt/neoquant
-npm install
-npm install oracledb
-npm run build
+# STEP 4: Clone GitHub project & compile production bundle
+if [ ! -d "/opt/kot/.git" ]; then
+  sudo mkdir -p /opt/kot
+  sudo chown -R $USER:$USER /opt/kot
+  git clone https://github.com/abhibroomies-hub/kot.git /opt/kot
+else
+  cd /opt/kot && git pull
+fi
+cd /opt/kot
+NODE_OPTIONS="--max-old-space-size=1536" npm install
+NODE_OPTIONS="--max-old-space-size=1536" npm run build
 
-# STEP 4: Unzip Oracle Autonomous DB Wallet (downloaded from OCI Console -> DB Connection -> Instance Wallet)
-mkdir -p /opt/neoquant/oracle_wallet
-unzip ~/Wallet_NeoQuantDB.zip -d /opt/neoquant/oracle_wallet
-
-# STEP 5: Create .env file with your Oracle ADB + Kotak Neo credentials
-cat << 'EOF' > /opt/neoquant/.env
+# STEP 5: Create .env file (Add Oracle Wallet / Gemini vars later if needed)
+if [ ! -f /opt/kot/.env ]; then
+cat << 'EOF' > /opt/kot/.env
 DEFAULT_APP_PORT=3000
 NODE_ENV=production
-ORACLE_DB_USER=ADMIN
-ORACLE_DB_PASSWORD=<YOUR_ORACLE_ADMIN_PASSWORD>
-ORACLE_DB_CONNECT_STRING=neoquantdb_high
-ORACLE_WALLET_DIR=/opt/neoquant/oracle_wallet
-ORACLE_WALLET_PASSWORD=<YOUR_WALLET_PASSWORD>
 EOF
+fi
 
-# STEP 6: Start NeoQuant 24x7 with PM2 (auto-restarts on crash + boots automatically after VM reboot)
-pm2 start "npx tsx server.ts" --name neoquant-live-bot
+# STEP 6: Configure Nginx Reverse Proxy on Port 80 (SSE real-time streaming enabled)
+sudo tee /etc/nginx/sites-available/neoquant > /dev/null << 'EOF'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection '';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 86400s;
+    }
+}
+EOF
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo ln -sf /etc/nginx/sites-available/neoquant /etc/nginx/sites-enabled/neoquant
+sudo nginx -t && sudo systemctl restart nginx
+
+# STEP 7: Start NeoQuant 24x7 with PM2 + Auto-Start on VM Reboot
+pm2 delete neoquant-live-bot 2>/dev/null || true
+NODE_ENV=production pm2 start /opt/kot/server.js --name neoquant-live-bot --cwd /opt/kot
 pm2 save
-pm2 startup systemd
+sudo env PATH=$PATH:/usr/bin pm2 startup systemd -u $USER --hp $HOME
 
-# STEP 7: Add Daily Auto-Self-Learning Cron Job (Every day 08:30 IST before NSE Market Open at 09:00 IST)
-# AI trains on latest real candles across all 19 pairs & upgrades Oracle AI_STRATEGY_MEMORY automatically!
-(crontab -l 2>/dev/null; echo "0 3 * * 1-5 curl -s -X POST http://127.0.0.1:3000/api/ai/train-all > /var/log/neoquant-ai-train.log 2>&1") | crontab -
+# STEP 8: Daily 08:30 IST (03:00 UTC) Self-Learning Cron before NSE Market Open
+(crontab -l 2>/dev/null | grep -v "train-all" || true; echo "0 3 * * 1-5 curl -s -X POST http://127.0.0.1:3000/api/ai/train-all > /tmp/neoquant-ai-train.log 2>&1") | crontab -
 
-echo "NeoQuant 24x7 Bot + Daily Self-Learning Cron is LIVE on Oracle Cloud!"
+echo "NeoQuant 24x7 Bot is LIVE at http://130.210.54.23 (and http://130.210.54.23:3000)!"
 `;
 
 export const KAGGLE_AI_TRAINER_PYTHON = `# ============================================================================
