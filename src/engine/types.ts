@@ -113,6 +113,7 @@ export interface RiskConfig {
   leverage: 1 | 5 | 10 | 20 | 35;
   trailingStopEnabled: boolean;
   breakEvenTriggerR: number;
+  highRiskMode?: boolean;
   brokerageTier: 'Kotak Trade Free (₹0 Intraday)' | 'Kotak Trade Free Pro (₹10/order)';
 }
 

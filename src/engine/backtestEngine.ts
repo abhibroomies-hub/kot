@@ -613,13 +613,14 @@ export const STRATEGY_CATALOG: {
 ];
 
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
-  initialCapitalInr: 100000,
-  riskPerTradePct: 1.0,
-  maxDailyDrawdownPct: 3.0,
-  maxDailyProfitTargetPct: 5.5,
-  leverage: 10,
+  initialCapitalInr: 1000,
+  riskPerTradePct: 10.0,
+  maxDailyDrawdownPct: 35.0,
+  maxDailyProfitTargetPct: 100.0,
+  leverage: 35,
   trailingStopEnabled: true,
-  breakEvenTriggerR: 1.1,
+  breakEvenTriggerR: 0.85,
+  highRiskMode: true,
   brokerageTier: 'Kotak Trade Free (₹0 Intraday)',
 };
 
@@ -717,12 +718,13 @@ export function getDefaultSlotConfig(
 }
 
 export function buildDefaultWorkspaceTabs(): WorkspaceTabState[] {
-  const pairs: TradingSymbol[] = ['USDINR', 'EURINR', 'GBPINR', 'JPYINR'];
+  // JPYINR & USDINR have the lowest NSE CDS contract notional (~₹58K & ~₹92K) for ₹1,000 high-risk MIS scalping
+  const pairs: TradingSymbol[] = ['USDINR', 'JPYINR', 'EURINR', 'GBPINR'];
   return pairs.map((symbol, idx) => ({
     tabId: `tab-${idx + 1}`,
     title: `${symbol}`,
     symbol,
-    autoBotActive: false,
+    autoBotActive: true,
     aiAutoAdaptAll: true,
     slots: {
       '30M': getDefaultSlotConfig('30M', symbol),
@@ -1173,6 +1175,24 @@ export function evaluateMultiTimeframeConfluence(
       confidencePct: Math.max(58, sellScore),
       alignedCount: sellCount,
       summary: `${sellCount}/4 Micro Timeframes Bearish`,
+    };
+  }
+
+  // Fast 1M or 30S scalp trigger when zero opposing signals exist across higher timeframes (ideal for High-Risk Currency Mode)
+  if (buyCount >= 1 && sellCount === 0 && (slots['1M'].liveSignal === 'BUY' || slots['30S'].liveSignal === 'BUY')) {
+    return {
+      direction: 'BUY',
+      confidencePct: Math.max(54, buyScore + 28),
+      alignedCount: buyCount,
+      summary: `Fast ${slots['1M'].liveSignal === 'BUY' ? '1M' : '30S'} Bullish Scalp Trigger (0HTF Conflict)`,
+    };
+  }
+  if (sellCount >= 1 && buyCount === 0 && (slots['1M'].liveSignal === 'SELL' || slots['30S'].liveSignal === 'SELL')) {
+    return {
+      direction: 'SELL',
+      confidencePct: Math.max(54, sellScore + 28),
+      alignedCount: sellCount,
+      summary: `Fast ${slots['1M'].liveSignal === 'SELL' ? '1M' : '30S'} Bearish Scalp Trigger (0HTF Conflict)`,
     };
   }
 

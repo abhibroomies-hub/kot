@@ -160,6 +160,7 @@ export default function App() {
   const [quotesBySymbol, setQuotesBySymbol] = useState<Partial<Record<TradingSymbol, LiveMarketQuote>>>({});
   const [kotakContracts, setKotakContracts] = useState<Record<string, string>>({});
   const [botDiagnostics, setBotDiagnostics] = useState<Record<string, string>>({});
+  const [disabledSegments, setDisabledSegments] = useState<string[]>([]);
   const [refreshingMargin, setRefreshingMargin] = useState<boolean>(false);
   const [quadRefreshNonce, setQuadRefreshNonce] = useState<number>(0);
   const [quadFetchError, setQuadFetchError] = useState<string | null>(null);
@@ -376,7 +377,14 @@ export default function App() {
               typeof data.botRiskConfig.breakEvenTriggerR === 'number'
                 ? data.botRiskConfig.breakEvenTriggerR
                 : prev.breakEvenTriggerR,
+            highRiskMode:
+              typeof data.botRiskConfig.highRiskMode === 'boolean'
+                ? data.botRiskConfig.highRiskMode
+                : true,
           }));
+        }
+        if (Array.isArray(data.disabledSegments)) {
+          setDisabledSegments(data.disabledSegments);
         }
         if (Array.isArray(data.armedSymbols)) {
           const armedSet = new Set<TradingSymbol>(
@@ -465,6 +473,7 @@ export default function App() {
           leverage: riskConfig.leverage,
           trailingStopEnabled: riskConfig.trailingStopEnabled,
           breakEvenTriggerR: riskConfig.breakEvenTriggerR,
+          highRiskMode: riskConfig.highRiskMode ?? true,
         },
       }),
     }).catch(() => {});
@@ -502,6 +511,9 @@ export default function App() {
           }
           if (data.botDiagnostics && typeof data.botDiagnostics === 'object') {
             setBotDiagnostics(data.botDiagnostics);
+          }
+          if (Array.isArray(data.disabledSegments)) {
+            setDisabledSegments(data.disabledSegments);
           }
           if (data.kotakContracts && typeof data.kotakContracts === 'object') {
             setKotakContracts(data.kotakContracts);
@@ -1294,6 +1306,39 @@ export default function App() {
     }
   };
 
+  const handleActivateHighRiskCurrencyMode = () => {
+    const currencyPairs: TradingSymbol[] = ['USDINR', 'JPYINR', 'EURINR', 'GBPINR'];
+    setTabs(() =>
+      currencyPairs.map((symbol, idx) => ({
+        tabId: `tab-${idx + 1}`,
+        title: symbol,
+        symbol,
+        autoBotActive: true,
+        aiAutoAdaptAll: true,
+        slots: {
+          '30M': getDefaultSlotConfig('30M', symbol),
+          '5M': getDefaultSlotConfig('5M', symbol),
+          '1M': getDefaultSlotConfig('1M', symbol),
+          '30S': getDefaultSlotConfig('30S', symbol),
+        },
+      }))
+    );
+    setActiveTabId('tab-1');
+    setRiskConfig((prev) => ({
+      ...prev,
+      riskPerTradePct: 10,
+      maxDailyDrawdownPct: 35,
+      leverage: 35,
+      trailingStopEnabled: true,
+      breakEvenTriggerR: 0.85,
+      highRiskMode: true,
+    }));
+    setActiveView('QUAD_DESK');
+    setStatusNotice(
+      '⚡ ₹1K High-Risk Currency Mode ACTIVE: USDINR, JPYINR, EURINR, GBPINR 24×7 Armed (35x MIS · 52% Fast Scalp Trigger · Auto Target +1/+2)'
+    );
+  };
+
   const handleToggleTabBot = (tabId: string) => {
     setTabs((prev) =>
       prev.map((t) => {
@@ -1969,7 +2014,7 @@ export default function App() {
           {/* =============================================================== */}
           {activeView === 'QUAD_DESK' && (
             <>
-              {/* Live 24x7 AI Bot Status, Margin Check & Dynamic Target Expansion Strip */}
+              {/* Live 24x7 AI Bot Status, High-Risk ₹1K Currency Mode & Dynamic Target Expansion Strip */}
               <div className="bg-slate-950/90 border border-slate-800 rounded-lg px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
                 <div className="flex flex-wrap items-center gap-2 min-w-0">
                   <span
@@ -1985,33 +2030,48 @@ export default function App() {
                   <span className="text-slate-300 font-mono text-[11px] truncate">
                     {botDiagnostics[activeSymbol] ||
                       (activeTab.autoBotActive
-                        ? `Scanning ${activeSymbol} 4-TF Confluence (${confluence.confidencePct}% / 62% needed) · Auto Target +1/+2 ON`
-                        : `Click "Start 24×7 ${activeSymbol} Bot" — AI auto-sizes lots to ₹${liveAccount.balanceInr.toFixed(0)} & expands new targets on TP hit!`)}
+                        ? `⚡ Scanning ${activeSymbol} 4-TF (${confluence.confidencePct}% / ${
+                            riskConfig.highRiskMode !== false ? 52 : 62
+                          }% trigger) · 35x MIS · Auto Target +1/+2 ON`
+                        : `Click "Start 24×7 ${activeSymbol} Bot" — AI auto-trades MIS & expands new targets on TP hit!`)}
                   </span>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 shrink-0 text-[11px] font-mono">
-                  <span className="text-slate-400">
-                    1 Lot Margin ({activeSymbol}):{' '}
-                    <strong
-                      className={
-                        liveAccount.balanceInr === 0 || liveAccount.balanceInr >= activeSpec.marginPerLotInr
-                          ? 'text-emerald-300'
-                          : 'text-amber-300'
-                      }
-                    >
-                      {formatInr(activeSpec.marginPerLotInr)}
-                    </strong>
-                  </span>
-                  {activeQuote?.marketStatus !== 'NSE_LIVE' && activeSymbol !== 'GOLDPETAL' && (
-                    <button
-                      type="button"
-                      onClick={() => handleChangeTabSymbol(activeTab.tabId, 'GOLDPETAL')}
-                      className="px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-300 font-semibold transition-colors"
-                    >
-                      Switch to MCX Gold (GOLDPETAL · ₹1,100 Margin · Live till 11:55 PM)
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    data-testid="activate-high-risk-currency"
+                    onClick={handleActivateHighRiskCurrencyMode}
+                    className={`px-2.5 py-0.5 rounded border font-semibold transition-colors ${
+                      riskConfig.highRiskMode !== false &&
+                      tabs.filter((t) => t.autoBotActive && INDIAN_SYMBOLS[t.symbol].exchange === 'NSE_CDS')
+                        .length >= 4
+                        ? 'bg-emerald-500/20 border-emerald-500/60 text-emerald-300'
+                        : 'bg-amber-500/20 hover:bg-amber-500/30 border-amber-500/60 text-amber-300'
+                    }`}
+                  >
+                    {riskConfig.highRiskMode !== false &&
+                    tabs.filter((t) => t.autoBotActive && INDIAN_SYMBOLS[t.symbol].exchange === 'NSE_CDS')
+                      .length >= 4
+                      ? '⚡ ₹1K High-Risk Currency ON (4 Pairs Armed · 35x MIS)'
+                      : '⚡ Activate ₹1K High-Risk Currency Bot (4 Pairs)'}
+                  </button>
+                  {activeQuote?.marketStatus !== 'NSE_LIVE' &&
+                    activeSymbol !== 'GOLDPETAL' &&
+                    !disabledSegments.includes('mcx_fo') &&
+                    !brokerOrders.some(
+                      (o) =>
+                        o.rejectionReason.toLowerCase().includes('exchg not enabled') &&
+                        (o.trdSymbol.includes('GOLD') || o.trdSymbol.includes('SILVER'))
+                    ) && (
+                      <button
+                        type="button"
+                        onClick={() => handleChangeTabSymbol(activeTab.tabId, 'GOLDPETAL')}
+                        className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-medium transition-colors"
+                      >
+                        MCX Gold (If Segment Enabled)
+                      </button>
+                    )}
                 </div>
               </div>
 

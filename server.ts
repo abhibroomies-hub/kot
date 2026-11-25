@@ -77,6 +77,7 @@ interface BotRiskConfigPersisted {
   leverage: 1 | 5 | 10 | 20 | 35;
   trailingStopEnabled: boolean;
   breakEvenTriggerR: number;
+  highRiskMode: boolean;
 }
 
 interface PersistentOracleVault {
@@ -130,14 +131,15 @@ function createInitialVault(): PersistentOracleVault {
 
   return {
     activeMode: 'LIVE',
-    autoBotRunning: false,
-    armedSymbols: [],
+    autoBotRunning: true,
+    armedSymbols: ['USDINR', 'JPYINR', 'EURINR', 'GBPINR'],
     botRiskConfig: {
-      riskPerTradePct: 1,
-      maxDailyDrawdownPct: 3,
-      leverage: 10,
+      riskPerTradePct: 10,
+      maxDailyDrawdownPct: 35,
+      leverage: 35,
       trailingStopEnabled: true,
-      breakEvenTriggerR: 1.1,
+      breakEvenTriggerR: 0.85,
+      highRiskMode: true,
     },
     strategyVerified: true,
     accounts: {
@@ -272,33 +274,52 @@ function loadOrInitVault(): PersistentOracleVault {
             )
           : [];
 
-        const prevArmed = Array.isArray(parsed.armedSymbols)
+        const prevRisk = parsed.botRiskConfig;
+        const isFirstHighRiskUpgrade = typeof prevRisk?.highRiskMode !== 'boolean';
+        const prevArmedTradable = Array.isArray(parsed.armedSymbols)
           ? (parsed.armedSymbols.filter(
-              (s): s is TradingSymbol => typeof s === 'string' && Boolean(INDIAN_SYMBOLS[s as TradingSymbol])
+              (s): s is TradingSymbol =>
+                typeof s === 'string' &&
+                Boolean(INDIAN_SYMBOLS[s as TradingSymbol]) &&
+                INDIAN_SYMBOLS[s as TradingSymbol].exchange !== 'GLOBAL_FX'
             ) as TradingSymbol[])
           : [];
-        const prevRisk = parsed.botRiskConfig;
-        const cleanedRisk: BotRiskConfigPersisted = {
-          riskPerTradePct:
-            typeof prevRisk?.riskPerTradePct === 'number'
-              ? Math.min(5, Math.max(0.1, prevRisk.riskPerTradePct))
-              : fresh.botRiskConfig.riskPerTradePct,
-          maxDailyDrawdownPct:
-            typeof prevRisk?.maxDailyDrawdownPct === 'number'
-              ? Math.min(20, Math.max(0.5, prevRisk.maxDailyDrawdownPct))
-              : fresh.botRiskConfig.maxDailyDrawdownPct,
-          leverage: ([1, 5, 10, 20, 35].includes(Number(prevRisk?.leverage))
-            ? Number(prevRisk?.leverage)
-            : fresh.botRiskConfig.leverage) as 1 | 5 | 10 | 20 | 35,
-          trailingStopEnabled:
-            typeof prevRisk?.trailingStopEnabled === 'boolean'
-              ? prevRisk.trailingStopEnabled
-              : fresh.botRiskConfig.trailingStopEnabled,
-          breakEvenTriggerR:
-            typeof prevRisk?.breakEvenTriggerR === 'number'
-              ? Math.min(5, Math.max(0.5, prevRisk.breakEvenTriggerR))
-              : fresh.botRiskConfig.breakEvenTriggerR,
-        };
+        const prevArmed =
+          isFirstHighRiskUpgrade || prevArmedTradable.length === 0
+            ? (['USDINR', 'JPYINR', 'EURINR', 'GBPINR'] as TradingSymbol[])
+            : prevArmedTradable;
+
+        const cleanedRisk: BotRiskConfigPersisted = isFirstHighRiskUpgrade
+          ? {
+              riskPerTradePct: 10,
+              maxDailyDrawdownPct: 35,
+              leverage: 35,
+              trailingStopEnabled: true,
+              breakEvenTriggerR: 0.85,
+              highRiskMode: true,
+            }
+          : {
+              riskPerTradePct:
+                typeof prevRisk?.riskPerTradePct === 'number'
+                  ? Math.min(20, Math.max(0.1, prevRisk.riskPerTradePct))
+                  : fresh.botRiskConfig.riskPerTradePct,
+              maxDailyDrawdownPct:
+                typeof prevRisk?.maxDailyDrawdownPct === 'number'
+                  ? Math.min(50, Math.max(0.5, prevRisk.maxDailyDrawdownPct))
+                  : fresh.botRiskConfig.maxDailyDrawdownPct,
+              leverage: ([1, 5, 10, 20, 35].includes(Number(prevRisk?.leverage))
+                ? Number(prevRisk?.leverage)
+                : fresh.botRiskConfig.leverage) as 1 | 5 | 10 | 20 | 35,
+              trailingStopEnabled:
+                typeof prevRisk?.trailingStopEnabled === 'boolean'
+                  ? prevRisk.trailingStopEnabled
+                  : fresh.botRiskConfig.trailingStopEnabled,
+              breakEvenTriggerR:
+                typeof prevRisk?.breakEvenTriggerR === 'number'
+                  ? Math.min(5, Math.max(0.4, prevRisk.breakEvenTriggerR))
+                  : fresh.botRiskConfig.breakEvenTriggerR,
+              highRiskMode: prevRisk.highRiskMode,
+            };
 
         const migrated: PersistentOracleVault = {
           activeMode: 'LIVE',
@@ -2399,6 +2420,8 @@ async function startServer() {
   const botDiagnostics = new Map<TradingSymbol, string>();
   let latestBrokerOrders: KotakBrokerOrderSummary[] = [];
   let latestBrokerPositions: KotakBrokerPositionSummary[] = [];
+  const disabledKotakSegments = new Set<string>();
+  const marginCooldownUntilBySymbol = new Map<TradingSymbol, number>();
 
   app.get('/api/kotak/status', (_req, res) => {
     const resolvedContracts: Record<string, string> = {};
@@ -2414,6 +2437,7 @@ async function startServer() {
       autoBotRunning: vault.armedSymbols.length > 0,
       armedSymbols: vault.armedSymbols,
       botRiskConfig: vault.botRiskConfig,
+      disabledSegments: Array.from(disabledKotakSegments),
       lastBotAction: lastServerBotAction,
       botDiagnostics: diagObj,
       strategyVerified: vault.strategyVerified,
@@ -2446,10 +2470,10 @@ async function startServer() {
     if (riskConfig && typeof riskConfig === 'object') {
       const rc = riskConfig as Record<string, unknown>;
       if (typeof rc.riskPerTradePct === 'number' && Number.isFinite(rc.riskPerTradePct)) {
-        vault.botRiskConfig.riskPerTradePct = Math.min(5, Math.max(0.1, rc.riskPerTradePct));
+        vault.botRiskConfig.riskPerTradePct = Math.min(20, Math.max(0.1, rc.riskPerTradePct));
       }
       if (typeof rc.maxDailyDrawdownPct === 'number' && Number.isFinite(rc.maxDailyDrawdownPct)) {
-        vault.botRiskConfig.maxDailyDrawdownPct = Math.min(20, Math.max(0.5, rc.maxDailyDrawdownPct));
+        vault.botRiskConfig.maxDailyDrawdownPct = Math.min(50, Math.max(0.5, rc.maxDailyDrawdownPct));
       }
       if ([1, 5, 10, 20, 35].includes(Number(rc.leverage))) {
         vault.botRiskConfig.leverage = Number(rc.leverage) as 1 | 5 | 10 | 20 | 35;
@@ -2458,7 +2482,10 @@ async function startServer() {
         vault.botRiskConfig.trailingStopEnabled = rc.trailingStopEnabled;
       }
       if (typeof rc.breakEvenTriggerR === 'number' && Number.isFinite(rc.breakEvenTriggerR)) {
-        vault.botRiskConfig.breakEvenTriggerR = Math.min(5, Math.max(0.5, rc.breakEvenTriggerR));
+        vault.botRiskConfig.breakEvenTriggerR = Math.min(5, Math.max(0.4, rc.breakEvenTriggerR));
+      }
+      if (typeof rc.highRiskMode === 'boolean') {
+        vault.botRiskConfig.highRiskMode = rc.highRiskMode;
       }
     }
     saveVault(vault);
@@ -2483,6 +2510,8 @@ async function startServer() {
     latestStreamQuotes.clear();
     latestBrokerOrders = [];
     latestBrokerPositions = [];
+    disabledKotakSegments.clear();
+    marginCooldownUntilBySymbol.clear();
     quadCache.clear();
     botDiagnostics.clear();
     vault.activeMode = 'LIVE';
@@ -2819,6 +2848,8 @@ async function startServer() {
       kotakLastQuoteAt.clear();
       kotakBasisAligned.clear();
       kotakLiveCandles.clear();
+      disabledKotakSegments.clear();
+      marginCooldownUntilBySymbol.clear();
       lastKotakQuotePollAt = 0;
       const [fetchedMargin] = await Promise.all([
         fetchKotakLiveMarginDetails(liveBrokerSession),
@@ -3021,6 +3052,20 @@ async function startServer() {
         fetchRawKotakPositions(session),
       ]);
       latestBrokerOrders = rawOrders.map(mapKotakOrderSummary).slice(0, 20);
+      // Automatically detect disabled segments (e.g. 'exchg not enabled for this acct' on GOLDM -> mcx_fo)
+      for (const ord of latestBrokerOrders) {
+        const rsn = ord.rejectionReason.toLowerCase();
+        if (rsn.includes('exchg not enabled') || rsn.includes('segment not enabled')) {
+          const symUp = ord.trdSymbol.toUpperCase();
+          if (symUp.includes('GOLD') || symUp.includes('SILVER') || symUp.includes('CRUDE')) {
+            disabledKotakSegments.add('mcx_fo');
+          } else if (symUp.includes('INR') && symUp.endsWith('FUT')) {
+            disabledKotakSegments.add('cde_fo');
+          } else if (symUp.includes('NIFTY')) {
+            disabledKotakSegments.add('nse_fo');
+          }
+        }
+      }
       if (posRes.ok) {
         latestBrokerPositions = posRes.rows.map(mapKotakPositionSummary);
       }
@@ -3271,15 +3316,25 @@ async function startServer() {
         acc.usedMarginInr = freshLimits.usedMarginInr;
       }
 
-      // Anti-Rejection Margin Guard: size lots strictly within 88% of real available Kotak INR balance
+      // Margin Sizing: In High-Risk Mode (user authorized ₹1,000 high-risk trading), NEVER locally block 1 Lot MIS!
+      // Let Kotak's actual Intraday MIS leverage execute 1 Lot directly, and scale >1 lots within 96% of balance as profits grow!
+      const isHighRisk = Boolean(vault.botRiskConfig.highRiskMode);
       let cleanLots = Math.max(1, Math.round(Number(params.lots) || 1));
       if (acc.balanceInr > 0) {
-        const maxAffordableLots = Math.floor((acc.balanceInr * 0.88) / spec.marginPerLotInr);
-        if (maxAffordableLots < 1 && acc.balanceInr < spec.marginPerLotInr * 0.75) {
+        const usableFactor = isHighRisk ? 0.96 : 0.88;
+        const maxAffordableLots = Math.floor((acc.balanceInr * usableFactor) / spec.marginPerLotInr);
+        if (!isHighRisk && maxAffordableLots < 1 && acc.balanceInr < spec.marginPerLotInr * 0.75) {
           return {
             ok: false,
             status: 400,
-            error: `Insufficient Kotak Margin: Available ₹${acc.balanceInr.toFixed(2)}, jabki ${cleanSym} (${resolved?.trdSymbol ?? cleanSym}) ke 1 Lot ke liye ~₹${spec.marginPerLotInr} chahiye. GOLDPETAL (~₹1,100) ya USDINR (~₹2,450) try karein!`,
+            error: `Insufficient Kotak Margin: Available ₹${acc.balanceInr.toFixed(2)}, jabki ${cleanSym} (${resolved?.trdSymbol ?? cleanSym}) ke 1 Lot ke liye ~₹${spec.marginPerLotInr} chahiye. High-Risk Mode ON karein ya margin add karein.`,
+          };
+        }
+        if (acc.balanceInr < 100) {
+          return {
+            ok: false,
+            status: 400,
+            error: `Available Kotak Balance ₹${acc.balanceInr.toFixed(2)} bahut kam hai.`,
           };
         }
         cleanLots = Math.max(1, Math.min(cleanLots, Math.max(1, maxAffordableLots)));
@@ -3295,7 +3350,7 @@ async function startServer() {
       const kotakTs = String(params.tradingSymbolOverride || resolved!.trdSymbol).trim().toUpperCase();
       const csvLotMult = resolved?.lotSize ?? 1;
 
-      // Build smart attempt sequence (exact CSV lotSize quantity, 1-lot fallback, NRML product fallback)
+      // Build smart attempt sequence (MIS Intraday max leverage first -> 1-lot MIS -> 1-lot NRML fallback)
       const attemptConfigs: Array<{ pc: 'MIS' | 'NRML'; lots: number; qt: number }> = [
         { pc: 'MIS', lots: cleanLots, qt: cleanLots * csvLotMult },
       ];
@@ -3362,6 +3417,7 @@ async function startServer() {
           // NOW VERIFY IN KOTAK /quick/user/orders THAT THIS nOrdNo ACTUALLY EXECUTED ON THE EXCHANGE!
           const check = await verifyKotakOrderExecution(liveBrokerSession, orderJson.nOrdNo);
           if (check.verified) {
+            marginCooldownUntilBySymbol.delete(cleanSym);
             verifiedFill = {
               orderId: check.orderId,
               exOrdId: check.exOrdId,
@@ -3374,6 +3430,19 @@ async function startServer() {
           }
 
           lastRejectMsg = `Order #${check.orderId} ${check.status}: ${check.reason}`;
+          const lowerReason = check.reason.toLowerCase();
+          if (lowerReason.includes('exchg not enabled') || lowerReason.includes('segment not enabled')) {
+            disabledKotakSegments.add(exchSeg);
+            break;
+          }
+          if (
+            lowerReason.includes('insufficient') ||
+            lowerReason.includes('shortfall') ||
+            lowerReason.includes('margin')
+          ) {
+            // Pause auto-bot retries on this specific symbol for 10 min so lower-margin pairs (JPYINR/USDINR) can run
+            marginCooldownUntilBySymbol.set(cleanSym, Date.now() + 10 * 60_000);
+          }
           if (check.fatalNonRetryable) {
             break;
           }
@@ -3792,14 +3861,24 @@ async function startServer() {
       return;
     }
 
+    const targetExchSeg =
+      spec.exchange === 'MCX_FO' ? 'mcx_fo' : spec.exchange === 'NSE_FNO' ? 'nse_fo' : 'cde_fo';
+    if (disabledKotakSegments.has(targetExchSeg)) {
+      botDiagnostics.set(
+        sym,
+        `Kotak Account me ${targetExchSeg.toUpperCase()} segment abhi enabled nahi hai — Active Currency Pairs (USDINR/JPYINR/EURINR/GBPINR) par focus hai!`
+      );
+      return;
+    }
+
     if (!isNseMarketOpen(sym)) {
       botDiagnostics.set(
         sym,
         spec.exchange === 'MCX_FO'
           ? `MCX Closed (Opens Mon–Fri 9:00 AM – 11:55 PM IST)`
           : spec.exchange === 'NSE_FNO'
-          ? `NSE F&O Closed (9:15 AM – 3:30 PM IST) · Gold/Commodities (GOLDPETAL/GOLDM) 11:55 PM tak LIVE hai!`
-          : `NSE Currency Closed (9:00 AM – 5:00 PM IST) · Abhi trade ke liye MCX Gold (GOLDPETAL/GOLDM) chunein (11:55 PM tak LIVE)!`
+          ? `NSE F&O Closed (Opens 9:15 AM – 3:30 PM IST)`
+          : `NSE Currency Armed (${sym} · ₹1K High-Risk MIS) · Subah 9:00 AM IST khulte hi Auto-Trade chalu hoga!`
       );
       return;
     }
@@ -3807,7 +3886,7 @@ async function startServer() {
     if (spec.exchange === 'GLOBAL_FX' && !kotakContracts.has(sym)) {
       botDiagnostics.set(
         sym,
-        `${sym} Global Spot Reference hai — Kotak Real Order ke liye GOLDPETAL, GOLDM, USDINR, EURINR ya NIFTY50 chunein`
+        `${sym} Global Spot Reference hai — Kotak Real Order ke liye USDINR, JPYINR, EURINR ya GBPINR chunein`
       );
       return;
     }
@@ -3820,8 +3899,18 @@ async function startServer() {
     if (hasOpenOnSym) return;
 
     const now = Date.now();
+    const cooldownUntil = marginCooldownUntilBySymbol.get(sym) ?? 0;
+    if (now < cooldownUntil) {
+      botDiagnostics.set(
+        sym,
+        `Kotak RMS Margin Cooldown on ${sym} (${Math.ceil((cooldownUntil - now) / 60000)}m left) — scanning lower-margin pairs (JPYINR/USDINR)`
+      );
+      return;
+    }
+
+    const isHighRisk = Boolean(vault.botRiskConfig.highRiskMode);
     const lastEval = lastServerBotEvalTs.get(sym) ?? 0;
-    if (now - lastEval < 2500) return;
+    if (now - lastEval < (isHighRisk ? 1500 : 2500)) return;
     lastServerBotEvalTs.set(sym, now);
 
     // Daily Drawdown Circuit Breaker check (NEVER stops on profit — only protects against max daily loss!)
@@ -3830,7 +3919,7 @@ async function startServer() {
       .filter((t) => t.ts >= startOfDayTs)
       .reduce((sum, t) => sum + (Number(t.pnlInr) || 0), 0);
     const liveAvail = vault.accounts.LIVE.balanceInr;
-    const refCap = liveAvail > 0 ? liveAvail : Math.max(5000, vault.accounts.LIVE.equityInr || 10000);
+    const refCap = liveAvail > 0 ? liveAvail : Math.max(1000, vault.accounts.LIVE.equityInr || 1000);
     if (todayPnlInr <= -refCap * (vault.botRiskConfig.maxDailyDrawdownPct / 100)) {
       const msg = `Daily Max Loss Guard Active (${vault.botRiskConfig.maxDailyDrawdownPct}% limit)`;
       lastServerBotAction = msg;
@@ -3838,11 +3927,15 @@ async function startServer() {
       return;
     }
 
-    if (liveAvail > 0 && liveAvail < spec.marginPerLotInr * 0.82) {
+    if (!isHighRisk && liveAvail > 0 && liveAvail < spec.marginPerLotInr * 0.82) {
       botDiagnostics.set(
         sym,
-        `Balance ₹${liveAvail.toFixed(0)} hai (${sym} 1 Lot margin ~₹${spec.marginPerLotInr}). Rejection se bachne ke liye GOLDPETAL (~₹1,100) ya USDINR (~₹2,450) lagayein!`
+        `Balance ₹${liveAvail.toFixed(0)} hai (${sym} 1 Lot margin ~₹${spec.marginPerLotInr}). High-Risk ₹1K Mode ON karein!`
       );
+      return;
+    }
+    if (liveAvail > 0 && liveAvail < 100) {
+      botDiagnostics.set(sym, `Available Kotak Balance ₹${liveAvail.toFixed(0)} bahut kam hai.`);
       return;
     }
 
@@ -3851,7 +3944,8 @@ async function startServer() {
         if (!vault.armedSymbols.includes(sym) || orderInFlightBySymbol.has(sym)) return;
         if (vault.liveTrades.some((t) => t.status === 'OPEN' && t.symbol === sym)) return;
 
-        const barBucket = Math.floor(quote.ts / timeframeToMs('1M'));
+        const bucketIntervalMs = isHighRisk ? timeframeToMs('30S') : timeframeToMs('1M');
+        const barBucket = Math.floor(quote.ts / bucketIntervalMs);
         if (lastServerBotBarBucket.get(sym) === barBucket) return;
 
         const quad = await loadQuadCandlesCached(sym);
@@ -3888,10 +3982,11 @@ async function startServer() {
         }
 
         const confluence = evaluateMultiTimeframeConfluence(slots);
-        if (confluence.direction === 'WAIT' || confluence.confidencePct < 62) {
+        const minConfidence = isHighRisk ? 52 : 62;
+        if (confluence.direction === 'WAIT' || confluence.confidencePct < minConfidence) {
           botDiagnostics.set(
             sym,
-            `AI Scanning 4-TF Live (${slots['1M'].patternLabel}) · Confluence ${confluence.confidencePct}% (62%+ hote hi Auto-Order jayega)`
+            `⚡ High-Risk AI Scanning ${sym} (${slots['1M'].patternLabel}) · Confluence ${confluence.confidencePct}% (${minConfidence}%+ hote hi Auto-Order jayega)`
           );
           return;
         }
