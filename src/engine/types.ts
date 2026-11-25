@@ -262,6 +262,7 @@ export interface LiveMarketQuote {
 export interface LiveBotTrade {
   id: string;
   symbol: TradingSymbol;
+  trdSymbol?: string;
   direction: 'BUY' | 'SELL';
   lots: number;
   entryPrice: number;
@@ -272,6 +273,9 @@ export interface LiveBotTrade {
   breakEvenLocked?: boolean;
   trailingActivated?: boolean;
   targetStepCount?: number;
+  exchangeVerified?: boolean;
+  kotakOrderStatus?: string;
+  exchangeOrderId?: string;
   pnlInr: number;
   pnlTicks: number;
   openedAt: string;
@@ -280,6 +284,28 @@ export interface LiveBotTrade {
   strategyUsed: StrategyArchetype;
   confluenceNote?: string;
   brokerOrderId?: string;
+}
+
+export interface KotakBrokerOrderSummary {
+  orderId: string;
+  trdSymbol: string;
+  side: 'BUY' | 'SELL';
+  qty: number;
+  status: string;
+  avgPrice: number;
+  rejectionReason: string;
+  orderTime: string;
+}
+
+export interface KotakBrokerPositionSummary {
+  trdSymbol: string;
+  exchangeSegment: string;
+  product: string;
+  netQty: number;
+  buyAmt: number;
+  sellAmt: number;
+  ltp: number;
+  pnlInr: number;
 }
 
 export interface CompoundingMilestone {

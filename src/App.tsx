@@ -6,6 +6,8 @@ import {
   Candle,
   IndicatorConfig,
   KotakAccountProfile,
+  KotakBrokerOrderSummary,
+  KotakBrokerPositionSummary,
   LiveBotTrade,
   LiveMarketQuote,
   OptimizationComparison,
@@ -46,6 +48,7 @@ import {
   AlertCircle,
   Bot,
   CandlestickChart,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Database,
@@ -142,6 +145,16 @@ export default function App() {
   const [liveTrades, setLiveTrades] = useState<LiveBotTrade[]>([]);
   const liveTradesRef = useRef<LiveBotTrade[]>([]);
   const [kotakOrderBookCount, setKotakOrderBookCount] = useState<number>(0);
+  const [brokerOrders, setBrokerOrders] = useState<KotakBrokerOrderSummary[]>([]);
+  const [brokerPositions, setBrokerPositions] = useState<KotakBrokerPositionSummary[]>([]);
+  const [syncingBrokerBook, setSyncingBrokerBook] = useState<boolean>(false);
+  const [orderSubmitting, setOrderSubmitting] = useState<boolean>(false);
+  const [closingTradeId, setClosingTradeId] = useState<string | null>(null);
+  const [brokerExecAlert, setBrokerExecAlert] = useState<{
+    ok: boolean;
+    text: string;
+    time: string;
+  } | null>(null);
 
   // Live Quotes & SSE Stream State
   const [quotesBySymbol, setQuotesBySymbol] = useState<Partial<Record<TradingSymbol, LiveMarketQuote>>>({});
@@ -232,19 +245,36 @@ export default function App() {
   const activeQuote = quotesBySymbol[activeSymbol] ?? null;
 
   const syncKotakOrderBook = useCallback(() => {
+    setSyncingBrokerBook(true);
     fetch('/api/kotak/orders')
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (data && Array.isArray(data.orders)) {
+          setBrokerOrders(data.orders);
           setKotakOrderBookCount(data.orders.length);
         }
+        if (data && Array.isArray(data.positions)) {
+          setBrokerPositions(data.positions);
+        }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        setSyncingBrokerBook(false);
+      });
   }, []);
 
   const mapServerTradesToUi = useCallback((rawList: unknown[]): LiveBotTrade[] => {
     return rawList
-      .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && (item as Record<string, unknown>).brokerMode === 'LIVE'))
+      .filter((item): item is Record<string, unknown> => {
+        if (!item || typeof item !== 'object') return false;
+        const rec = item as Record<string, unknown>;
+        if (rec.brokerMode !== 'LIVE') return false;
+        // Strictly allow ONLY trades verified filled on Kotak Exchange!
+        return (
+          rec.exchangeVerified === true ||
+          String(rec.confluenceNote ?? '').includes('[KOTAK_VERIFIED_FILL')
+        );
+      })
       .map((t) => {
         const sym = t.symbol as TradingSymbol;
         const spec = INDIAN_SYMBOLS[sym];
@@ -268,6 +298,7 @@ export default function App() {
         return {
           id: String(t.id),
           symbol: sym,
+          trdSymbol: t.trdSymbol ? String(t.trdSymbol) : undefined,
           direction: dir,
           lots,
           entryPrice: entry,
@@ -287,6 +318,9 @@ export default function App() {
           strategyUsed: (t.strategyUsed as StrategyArchetype) || 'EMA_RSI_CONFLUENCE',
           confluenceNote: t.confluenceNote ? String(t.confluenceNote) : undefined,
           brokerOrderId: t.brokerOrderId ? String(t.brokerOrderId) : undefined,
+          exchangeVerified: true,
+          kotakOrderStatus: t.kotakOrderStatus ? String(t.kotakOrderStatus) : 'COMPLETE',
+          exchangeOrderId: t.exchangeOrderId ? String(t.exchangeOrderId) : undefined,
         };
       });
   }, []);
@@ -307,10 +341,17 @@ export default function App() {
             data.accounts.LIVE.sessionState === 'NEO_LIVE_AUTHENTICATED'
           ) {
             setStatusNotice(
-              `Kotak Neo LIVE Connected (UCC ${data.accounts.LIVE.ucc}) · 24×7 Oracle Server Ready`
+              `Kotak Neo LIVE Connected (UCC ${data.accounts.LIVE.ucc}) · 24×7 Real Exchange Verification Active`
             );
             syncKotakOrderBook();
           }
+        }
+        if (Array.isArray(data.brokerOrders)) {
+          setBrokerOrders(data.brokerOrders);
+          setKotakOrderBookCount(data.brokerOrders.length);
+        }
+        if (Array.isArray(data.brokerPositions)) {
+          setBrokerPositions(data.brokerPositions);
         }
         if (data.botRiskConfig && typeof data.botRiskConfig === 'object') {
           setRiskConfig((prev) => ({
@@ -451,6 +492,13 @@ export default function App() {
             liveTradesRef.current = mapped;
             setLiveTrades(mapped);
           }
+          if (Array.isArray(data.brokerOrders)) {
+            setBrokerOrders(data.brokerOrders);
+            setKotakOrderBookCount(data.brokerOrders.length);
+          }
+          if (Array.isArray(data.brokerPositions)) {
+            setBrokerPositions(data.brokerPositions);
+          }
           if (data.botDiagnostics && typeof data.botDiagnostics === 'object') {
             setBotDiagnostics(data.botDiagnostics);
           }
@@ -586,18 +634,6 @@ export default function App() {
     });
   }, [isKotakLoggedIn, openSymbolsKey, activeSymbol, quadRefreshNonce]);
 
-  const settleBalanceInr = useCallback((_mode: BrokerMode, pnlInr: number) => {
-    setLiveAccount((acc) => {
-      const nextBal = Number(Math.max(0, acc.balanceInr + pnlInr).toFixed(2));
-      return {
-        ...acc,
-        balanceInr: nextBal,
-        equityInr: nextBal,
-        lastHeartbeat: new Date().toLocaleTimeString(),
-      };
-    });
-  }, []);
-
   const placeKotakOrder = useCallback(
     (
       sym: TradingSymbol,
@@ -606,6 +642,7 @@ export default function App() {
       confluenceNote?: string,
       atrOverride?: number
     ) => {
+      if (orderSubmitting) return;
       const spec = INDIAN_SYMBOLS[sym];
       const tabForSym =
         tabsRef.current.find((t) => t.tabId === activeTabIdRef.current && t.symbol === sym) ??
@@ -627,7 +664,7 @@ export default function App() {
       const mode: BrokerMode = 'LIVE';
 
       const availableForOrder =
-        liveAccount.balanceInr > 0 ? liveAccount.balanceInr : Math.max(5000, equityRef.current);
+        liveAccount.balanceInr > 0 ? liveAccount.balanceInr : Math.max(1000, equityRef.current);
       const lots = calculateLotSize(
         availableForOrder,
         riskConfigRef.current.riskPerTradePct,
@@ -645,30 +682,11 @@ export default function App() {
       );
 
       const tradeId = `NEO-${Date.now().toString().slice(-6)}`;
-      const newTrade: LiveBotTrade = {
-        id: tradeId,
-        symbol: sym,
-        direction,
-        lots,
-        entryPrice: entry,
-        currentPrice: entry,
-        stopLoss,
-        takeProfit,
-        initialStopDistance: slDist,
-        breakEvenLocked: false,
-        trailingActivated: false,
-        pnlInr: 0,
-        pnlTicks: 0,
-        openedAt: new Date().toLocaleTimeString(),
-        status: 'OPEN',
-        brokerMode: mode,
-        strategyUsed: primarySlot.strategy,
-        confluenceNote,
-      };
-
-      const nextList = [newTrade, ...liveTradesRef.current];
-      liveTradesRef.current = nextList;
-      setLiveTrades(nextList);
+      // ZERO OPTIMISTIC INSERTION: Wait until Kotak /quick/user/orders confirms COMPLETE fill!
+      setOrderSubmitting(true);
+      setStatusNotice(
+        `Kotak Neo par ${direction} ${lots}L ${sym} bhej rahe hain aur real Exchange Fill verify kar rahe hain...`
+      );
 
       fetch('/api/kotak/order', {
         method: 'POST',
@@ -681,6 +699,7 @@ export default function App() {
           entryPrice: entry,
           stopLoss,
           takeProfit,
+          initialStopDistance: slDist,
           brokerMode: mode,
           strategyUsed: primarySlot.strategy,
           confluenceNote,
@@ -688,24 +707,33 @@ export default function App() {
       })
         .then(async (r) => {
           const data = await r.json().catch(() => ({}));
-          if (!r.ok) {
-            throw new Error(data.error || 'Kotak Order failed');
+          if (!r.ok || !data?.trade?.exchangeVerified) {
+            throw new Error(
+              data?.error || 'Kotak Exchange par order execute nahi hua (Order Book check karein)'
+            );
           }
           return data;
         })
         .then((resp) => {
-          if (resp?.trade) {
-            const updated = liveTradesRef.current.map((tr) =>
-              tr.id === tradeId
-                ? {
-                    ...tr,
-                    lots: Number(resp.trade.lots) || tr.lots,
-                    brokerOrderId: resp.trade.brokerOrderId ?? tr.brokerOrderId,
-                  }
-                : tr
-            );
-            liveTradesRef.current = updated;
-            setLiveTrades(updated);
+          const verifiedUiTrades = mapServerTradesToUi([resp.trade]);
+          if (verifiedUiTrades.length > 0) {
+            const verifiedTr = verifiedUiTrades[0];
+            const filtered = liveTradesRef.current.filter((tr) => tr.id !== verifiedTr.id);
+            const nextList = [verifiedTr, ...filtered];
+            liveTradesRef.current = nextList;
+            setLiveTrades(nextList);
+
+            const okMsg = `VERIFIED ON KOTAK EXCHANGE: ${verifiedTr.direction} ${verifiedTr.lots}L ${
+              verifiedTr.trdSymbol ?? verifiedTr.symbol
+            } (Order #${verifiedTr.brokerOrderId}) COMPLETE @ ${verifiedTr.entryPrice.toFixed(
+              spec.decimals
+            )}`;
+            setStatusNotice(okMsg);
+            setBrokerExecAlert({
+              ok: true,
+              text: okMsg,
+              time: new Date().toLocaleTimeString(),
+            });
           }
           if (resp?.account) {
             setLiveAccount(resp.account);
@@ -713,88 +741,108 @@ export default function App() {
           syncKotakOrderBook();
         })
         .catch((err) => {
-          const reverted = liveTradesRef.current.filter((tr) => tr.id !== tradeId);
-          liveTradesRef.current = reverted;
-          setLiveTrades(reverted);
-          setStatusNotice(err instanceof Error ? err.message : 'Kotak Order rejected');
+          const errMsg = err instanceof Error ? err.message : 'Kotak Order rejected';
+          setStatusNotice(errMsg);
+          setBrokerExecAlert({
+            ok: false,
+            text: errMsg,
+            time: new Date().toLocaleTimeString(),
+          });
+          // Refresh Kotak Order Book immediately so user sees the exact REJECTED row & reason from Kotak!
+          syncKotakOrderBook();
+        })
+        .finally(() => {
+          setOrderSubmitting(false);
         });
-
-      setStatusNotice(
-        `Kotak Neo LIVE ${direction} ${lots} Lots ${sym} @ ${entry.toFixed(spec.decimals)} (${confluenceNote ?? 'Manual'})`
-      );
     },
-    [liveAccount.balanceInr, syncKotakOrderBook]
+    [liveAccount.balanceInr, mapServerTradesToUi, orderSubmitting, syncKotakOrderBook]
   );
 
   const handleCloseLiveTrade = useCallback(
     (tradeId: string) => {
-      let closurePayload: {
-        id: string;
-        exitPrice: number;
-        pnlInr: number;
-        pnlTicks: number;
-        status: 'CLOSED_MANUAL';
-        brokerMode: BrokerMode;
-      } | null = null;
+      const target = liveTradesRef.current.find((t) => t.id === tradeId && t.status === 'OPEN');
+      if (!target || closingTradeId === tradeId) return;
 
-      const updated = liveTradesRef.current.map((t) => {
-        if (t.id !== tradeId || t.status !== 'OPEN') return t;
-        const spec = INDIAN_SYMBOLS[t.symbol];
-        const q = quotesRef.current[t.symbol];
-        const exitRaw = q ? (t.direction === 'BUY' ? q.bid : q.ask) : t.currentPrice;
-        const exitPrice = Number(exitRaw.toFixed(spec.decimals));
-        const diff = t.direction === 'BUY' ? exitPrice - t.entryPrice : t.entryPrice - exitPrice;
-        const pnlTicks = Number((diff / spec.tickSize).toFixed(1));
-        const pnlInr = Number((pnlTicks * spec.valuePerTickInr * t.lots).toFixed(2));
-        closurePayload = {
-          id: t.id,
+      const spec = INDIAN_SYMBOLS[target.symbol];
+      const q = quotesRef.current[target.symbol];
+      const exitRaw = q ? (target.direction === 'BUY' ? q.bid : q.ask) : target.currentPrice;
+      const exitPrice = Number(exitRaw.toFixed(spec.decimals));
+      const diff =
+        target.direction === 'BUY' ? exitPrice - target.entryPrice : target.entryPrice - exitPrice;
+      const pnlTicks = Number((diff / spec.tickSize).toFixed(1));
+      const pnlInr = Number((pnlTicks * spec.valuePerTickInr * target.lots).toFixed(2));
+
+      setClosingTradeId(tradeId);
+      setStatusNotice(
+        `Kotak Neo par ${target.trdSymbol ?? target.symbol} square-off order verify ho raha hai...`
+      );
+
+      // ZERO FAKE BALANCE MUTATION: Square-off on Kotak first, then sync real balance from Kotak /quick/user/limits!
+      fetch('/api/kotak/close', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: target.id,
           exitPrice,
           pnlInr,
           pnlTicks,
           status: 'CLOSED_MANUAL',
-          brokerMode: t.brokerMode,
-        };
-        return {
-          ...t,
-          currentPrice: exitPrice,
-          pnlTicks,
-          pnlInr,
-          status: 'CLOSED_MANUAL' as const,
-        };
-      });
-
-      liveTradesRef.current = updated;
-      setLiveTrades(updated);
-
-      if (closurePayload) {
-        const p = closurePayload as {
-          id: string;
-          exitPrice: number;
-          pnlInr: number;
-          pnlTicks: number;
-          status: 'CLOSED_MANUAL';
-          brokerMode: BrokerMode;
-        };
-        settleBalanceInr(p.brokerMode, p.pnlInr);
-        fetch('/api/kotak/close', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(p),
+          brokerMode: target.brokerMode,
+        }),
+      })
+        .then(async (r) => {
+          const data = await r.json().catch(() => ({}));
+          if (!r.ok) {
+            throw new Error(data?.error || 'Kotak Square-Off order fail hua');
+          }
+          return data;
         })
-          .then((r) => (r.ok ? r.json() : null))
-          .then((data) => {
-            if (Array.isArray(data?.aiMemory)) {
-              setAiMemory(data.aiMemory);
-              aiMemoryRef.current = data.aiMemory;
-            }
-            if (data?.aiEvolutionNote) {
-              setStatusNotice(`AI Self-Learned: ${data.aiEvolutionNote}`);
-            }
-          })
-          .catch(() => {});
-      }
+        .then((data) => {
+          const updated = liveTradesRef.current.map((t) =>
+            t.id === tradeId
+              ? {
+                  ...t,
+                  currentPrice: exitPrice,
+                  pnlTicks,
+                  pnlInr,
+                  status: 'CLOSED_MANUAL' as const,
+                }
+              : t
+          );
+          liveTradesRef.current = updated;
+          setLiveTrades(updated);
+
+          if (data?.account) {
+            setLiveAccount(data.account);
+          }
+          if (Array.isArray(data?.aiMemory)) {
+            setAiMemory(data.aiMemory);
+            aiMemoryRef.current = data.aiMemory;
+          }
+          const doneMsg = `KOTAK SQUARE-OFF VERIFIED: ${target.trdSymbol ?? target.symbol} closed · Real Kotak Balance Synced`;
+          setStatusNotice(data?.aiEvolutionNote ? `${doneMsg} · ${data.aiEvolutionNote}` : doneMsg);
+          setBrokerExecAlert({
+            ok: true,
+            text: doneMsg,
+            time: new Date().toLocaleTimeString(),
+          });
+          syncKotakOrderBook();
+        })
+        .catch((err) => {
+          const errMsg = err instanceof Error ? err.message : 'Kotak Square-Off failed';
+          setStatusNotice(errMsg);
+          setBrokerExecAlert({
+            ok: false,
+            text: errMsg,
+            time: new Date().toLocaleTimeString(),
+          });
+          syncKotakOrderBook();
+        })
+        .finally(() => {
+          setClosingTradeId(null);
+        });
     },
-    [settleBalanceInr]
+    [closingTradeId, syncKotakOrderBook]
   );
 
   // Zero-Delay Multi-Tab SSE Stream Hub (Strictly gated on Kotak Neo LIVE Login)
@@ -1320,6 +1368,13 @@ export default function App() {
         if (data.kotakContracts && typeof data.kotakContracts === 'object') {
           setKotakContracts(data.kotakContracts);
         }
+        if (Array.isArray(data.brokerOrders)) {
+          setBrokerOrders(data.brokerOrders);
+          setKotakOrderBookCount(data.brokerOrders.length);
+        }
+        if (Array.isArray(data.brokerPositions)) {
+          setBrokerPositions(data.brokerPositions);
+        }
         // Immediately auto-load all 4 real TradingView charts + live NSE quotes + Kotak orders
         quadCandlesRef.current = {};
         setQuadCandlesBySymbol({});
@@ -1360,6 +1415,7 @@ export default function App() {
           }));
         }
       }
+      syncKotakOrderBook();
       return null;
     } catch {
       return 'Network error while refreshing Kotak margin';
@@ -1403,9 +1459,14 @@ export default function App() {
       }
       quadCandlesRef.current = {};
       quotesRef.current = {};
+      liveTradesRef.current = [];
+      setLiveTrades([]);
       setQuadCandlesBySymbol({});
       setQuotesBySymbol({});
       setScannerOpportunities([]);
+      setBrokerOrders([]);
+      setBrokerPositions([]);
+      setBrokerExecAlert(null);
       setKotakOrderBookCount(0);
       setActiveView('QUAD_DESK');
     } catch {
@@ -1851,23 +1912,25 @@ export default function App() {
               <div className="flex items-center gap-1">
                 <button
                   type="button"
+                  disabled={orderSubmitting}
                   onClick={() =>
                     placeKotakOrder(activeSymbol, 'BUY', activeQuote, 'Manual 4-TF Instant Buy')
                   }
-                  className="flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-semibold whitespace-nowrap shrink-0"
+                  className="flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-[11px] font-semibold whitespace-nowrap shrink-0"
                 >
                   <TrendingUp className="w-3 h-3" />
-                  Buy
+                  {orderSubmitting ? 'Verifying...' : 'Buy'}
                 </button>
                 <button
                   type="button"
+                  disabled={orderSubmitting}
                   onClick={() =>
                     placeKotakOrder(activeSymbol, 'SELL', activeQuote, 'Manual 4-TF Instant Sell')
                   }
-                  className="flex items-center gap-1 px-2.5 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white text-[11px] font-semibold whitespace-nowrap shrink-0"
+                  className="flex items-center gap-1 px-2.5 py-1 rounded bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-[11px] font-semibold whitespace-nowrap shrink-0"
                 >
                   <TrendingDown className="w-3 h-3" />
-                  Sell
+                  {orderSubmitting ? 'Verifying...' : 'Sell'}
                 </button>
               </div>
             </div>
@@ -1924,6 +1987,36 @@ export default function App() {
                 </div>
               </div>
 
+              {brokerExecAlert && (
+                <div
+                  role="alert"
+                  className={`rounded-lg px-3 py-2 text-xs flex items-center justify-between gap-2 border ${
+                    brokerExecAlert.ok
+                      ? 'bg-emerald-950/70 border-emerald-500/60 text-emerald-200'
+                      : 'bg-rose-950/75 border-rose-500/70 text-rose-200'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    {brokerExecAlert.ok ? (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                    )}
+                    <span className="font-mono text-[11px] break-words">
+                      [{brokerExecAlert.time}] {brokerExecAlert.text}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setBrokerExecAlert(null)}
+                    aria-label="Dismiss Order Alert"
+                    className="p-1 rounded hover:bg-slate-800/60 text-slate-300 shrink-0"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
               {quadFetchError && (
                 <div
                   role="alert"
@@ -1956,7 +2049,12 @@ export default function App() {
                   const slot = activeTab.slots[tf];
                   const rawCandles = currentFrames?.[tf] ?? [];
                   const activeOpenTrade =
-                    liveTrades.find((tr) => tr.status === 'OPEN' && tr.symbol === activeSymbol) ?? null;
+                    liveTrades.find(
+                      (tr) =>
+                        tr.status === 'OPEN' &&
+                        tr.symbol === activeSymbol &&
+                        tr.exchangeVerified === true
+                    ) ?? null;
                   return (
                     <QuadChartCell
                       key={`${activeTab.tabId}-${activeSymbol}-${tf}`}
@@ -2025,95 +2123,268 @@ export default function App() {
                 })}
               </section>
 
-              {/* Active Real Kotak Neo LIVE Order Book Strip */}
+              {/* REAL-TIME KOTAK NEO PHONE APP VERIFICATION & ORDER BOOK HUB */}
               <section
-                aria-label="Kotak Neo Open & Recent Orders"
-                className="bg-slate-900/90 border border-slate-800 rounded-lg p-3 flex flex-col gap-2"
+                aria-label="Kotak Neo Real Exchange Positions & Order Book"
+                className="bg-slate-900/95 border border-slate-800 rounded-lg p-3 flex flex-col gap-3"
               >
-                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                  <div className="flex items-center gap-2 font-semibold text-slate-200">
-                    <Bot className="w-4 h-4 text-emerald-400" />
-                    Kotak Neo LIVE Order Book ({openPositions.length} Open · {liveTrades.length} Session · {kotakOrderBookCount} Exchange)
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs border-b border-slate-800 pb-2">
+                  <div className="flex flex-wrap items-center gap-2 font-semibold text-slate-100">
+                    <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                    <span>
+                      Kotak Neo Phone App 1:1 Real Verification ({brokerPositions.filter((p) => p.netQty !== 0).length}{' '}
+                      Kotak Open Positions · {kotakOrderBookCount} Today&apos;s Kotak Orders)
+                    </span>
                   </div>
-                  <div className="font-mono text-slate-400 tabular-nums">
-                    Kotak Real Margin: <strong className="text-emerald-400">{formatInr(liveAccount.equityInr)}</strong>
+                  <div className="flex flex-wrap items-center gap-3 font-mono text-[11px] tabular-nums">
+                    <span className="text-slate-400">
+                      Available Margin:{' '}
+                      <strong className="text-emerald-400">{formatInr(liveAccount.balanceInr)}</strong>
+                    </span>
+                    <span className="text-slate-400">
+                      Used Margin:{' '}
+                      <strong className="text-sky-300">{formatInr(liveAccount.usedMarginInr ?? 0)}</strong>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        syncKotakOrderBook();
+                        void handleRefreshKotakLimits();
+                      }}
+                      disabled={syncingBrokerBook || refreshingMargin}
+                      className="flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-300 font-sans font-medium transition-colors"
+                    >
+                      <RefreshCw
+                        className={`w-3 h-3 ${syncingBrokerBook || refreshingMargin ? 'animate-spin' : ''}`}
+                      />
+                      Sync Kotak App Now
+                    </button>
                   </div>
                 </div>
 
-                {liveTrades.length === 0 ? (
-                  <p className="text-xs text-slate-400">
-                    No active LIVE trades placed yet in this session. Arm <strong className="text-slate-200">Start {activeSymbol} Bot</strong> or click <strong className="text-emerald-400">Buy / Sell</strong> to execute directly on Kotak Neo LIVE API.
-                  </p>
-                ) : (
-                  <div className="overflow-x-auto border border-slate-800 rounded-md">
-                    <table className="w-full text-left border-collapse text-xs">
-                      <thead>
-                        <tr className="bg-slate-950 text-slate-400 border-b border-slate-800">
-                          <th className="py-1.5 px-2.5 font-medium">Order</th>
-                          <th className="py-1.5 px-2.5 font-medium">Symbol</th>
-                          <th className="py-1.5 px-2.5 font-medium">Side</th>
-                          <th className="py-1.5 px-2.5 font-medium text-right">Lots</th>
-                          <th className="py-1.5 px-2.5 font-medium text-right">Entry</th>
-                          <th className="py-1.5 px-2.5 font-medium text-right">SL / TP</th>
-                          <th className="py-1.5 px-2.5 font-medium text-right">P&L (₹ INR)</th>
-                          <th className="py-1.5 px-2.5 font-medium text-right">Status</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
-                        {liveTrades.slice(0, 8).map((tr) => {
-                          const sp = INDIAN_SYMBOLS[tr.symbol];
-                          return (
-                            <tr key={tr.id} className="hover:bg-slate-800/40">
-                              <td className="py-1.5 px-2.5 text-slate-300">
-                                {tr.brokerOrderId ?? tr.id}
-                              </td>
-                              <td className="py-1.5 px-2.5 text-white font-semibold">{tr.symbol}</td>
-                              <td
-                                className={`py-1.5 px-2.5 font-semibold ${
-                                  tr.direction === 'BUY' ? 'text-emerald-400' : 'text-rose-400'
-                                }`}
-                              >
-                                {tr.direction}
-                              </td>
-                              <td className="py-1.5 px-2.5 text-right text-slate-200">{tr.lots}</td>
-                              <td className="py-1.5 px-2.5 text-right text-slate-300">
-                                {tr.entryPrice.toFixed(sp.decimals)}
-                              </td>
-                              <td className="py-1.5 px-2.5 text-right text-slate-400">
-                                {tr.stopLoss.toFixed(sp.decimals)} / {tr.takeProfit.toFixed(sp.decimals)}
-                                {(tr.targetStepCount ?? 0) > 0 && (
-                                  <span className="ml-1 px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 text-[10px]">
-                                    TP+{tr.targetStepCount}
-                                  </span>
-                                )}
-                              </td>
-                              <td
-                                className={`py-1.5 px-2.5 text-right font-semibold ${
-                                  tr.pnlInr >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                                }`}
-                              >
-                                {formatInr(tr.pnlInr, true)}
-                              </td>
-                              <td className="py-1.5 px-2.5 text-right">
-                                {tr.status === 'OPEN' ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => handleCloseLiveTrade(tr.id)}
-                                    className="px-2 py-0.5 bg-slate-800 hover:bg-rose-600 text-slate-200 hover:text-white rounded text-[11px] font-sans"
-                                  >
-                                    Exit
-                                  </button>
-                                ) : (
-                                  <span className="text-[11px] text-slate-400">{tr.status}</span>
-                                )}
-                              </td>
+                {/* 1. Direct Kotak Phone App Positions (/quick/user/positions) + Verified AI-Managed SL/TP */}
+                <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+                  {/* Left Sub-panel: Direct Kotak Phone App Live Positions */}
+                  <div className="bg-slate-950/80 border border-slate-800 rounded-md p-2.5 flex flex-col gap-2">
+                    <div className="flex items-center justify-between text-[11px] font-semibold text-slate-200">
+                      <span>1. Direct Kotak Phone App Positions (GET /quick/user/positions)</span>
+                      <span className="font-mono text-emerald-400">
+                        {brokerPositions.filter((p) => p.netQty !== 0).length} Active
+                      </span>
+                    </div>
+                    {brokerPositions.length === 0 ? (
+                      <p className="text-[11px] text-slate-400 font-mono py-1">
+                        Kotak Phone App me abhi 0 positions hain (GET /quick/user/positions).
+                      </p>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse text-[11px]">
+                          <thead>
+                            <tr className="text-slate-400 border-b border-slate-800">
+                              <th className="py-1 px-2">Contract</th>
+                              <th className="py-1 px-2">Seg</th>
+                              <th className="py-1 px-2 text-right">Net Qty</th>
+                              <th className="py-1 px-2 text-right">LTP</th>
+                              <th className="py-1 px-2 text-right">Kotak MTM</th>
                             </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/60 font-mono tabular-nums">
+                            {brokerPositions.slice(0, 8).map((pos, i) => (
+                              <tr key={`${pos.trdSymbol}-${i}`} className="hover:bg-slate-900/60">
+                                <td className="py-1 px-2 font-semibold text-white">{pos.trdSymbol}</td>
+                                <td className="py-1 px-2 text-slate-400">{pos.exchangeSegment}</td>
+                                <td
+                                  className={`py-1 px-2 text-right font-semibold ${
+                                    pos.netQty > 0
+                                      ? 'text-emerald-400'
+                                      : pos.netQty < 0
+                                      ? 'text-rose-400'
+                                      : 'text-slate-400'
+                                  }`}
+                                >
+                                  {pos.netQty}
+                                </td>
+                                <td className="py-1 px-2 text-right text-slate-300">{pos.ltp}</td>
+                                <td
+                                  className={`py-1 px-2 text-right font-semibold ${
+                                    pos.pnlInr >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                                  }`}
+                                >
+                                  {formatInr(pos.pnlInr, true)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
                   </div>
-                )}
+
+                  {/* Right Sub-panel: Exchange-Verified AI SL/TP Managed Trades */}
+                  <div className="bg-slate-950/80 border border-slate-800 rounded-md p-2.5 flex flex-col gap-2">
+                    <div className="flex items-center justify-between text-[11px] font-semibold text-slate-200">
+                      <span>2. Exchange-Verified AI SL/TP Tracker ({openPositions.length} Open)</span>
+                      <span className="font-mono text-sky-400">Zero Fake / Verified Fills Only</span>
+                    </div>
+                    {liveTrades.length === 0 ? (
+                      <p className="text-[11px] text-slate-400 font-mono py-1">
+                        Koi verified fill abhi open nahi hai. Jab Kotak Order COMPLETE hoga tabhi yahan SL/TP active hoga.
+                      </p>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse text-[11px]">
+                          <thead>
+                            <tr className="text-slate-400 border-b border-slate-800">
+                              <th className="py-1 px-2">Kotak #</th>
+                              <th className="py-1 px-2">Contract</th>
+                              <th className="py-1 px-2">Side</th>
+                              <th className="py-1 px-2 text-right">Entry</th>
+                              <th className="py-1 px-2 text-right">SL / TP</th>
+                              <th className="py-1 px-2 text-right">MTM</th>
+                              <th className="py-1 px-2 text-right">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/60 font-mono tabular-nums">
+                            {liveTrades.slice(0, 6).map((tr) => {
+                              const sp = INDIAN_SYMBOLS[tr.symbol];
+                              return (
+                                <tr key={tr.id} className="hover:bg-slate-900/60">
+                                  <td className="py-1 px-2 text-emerald-300">
+                                    #{tr.brokerOrderId ?? tr.id}
+                                  </td>
+                                  <td className="py-1 px-2 text-white font-semibold">
+                                    {tr.trdSymbol ?? tr.symbol} ({tr.lots}L)
+                                  </td>
+                                  <td
+                                    className={`py-1 px-2 font-semibold ${
+                                      tr.direction === 'BUY' ? 'text-emerald-400' : 'text-rose-400'
+                                    }`}
+                                  >
+                                    {tr.direction}
+                                  </td>
+                                  <td className="py-1 px-2 text-right text-slate-300">
+                                    {tr.entryPrice.toFixed(sp.decimals)}
+                                  </td>
+                                  <td className="py-1 px-2 text-right text-slate-400">
+                                    {tr.stopLoss.toFixed(sp.decimals)} / {tr.takeProfit.toFixed(sp.decimals)}
+                                    {(tr.targetStepCount ?? 0) > 0 && (
+                                      <span className="ml-1 px-1 rounded bg-emerald-500/20 text-emerald-300 text-[10px]">
+                                        +{tr.targetStepCount}
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td
+                                    className={`py-1 px-2 text-right font-semibold ${
+                                      tr.pnlInr >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                                    }`}
+                                  >
+                                    {formatInr(tr.pnlInr, true)}
+                                  </td>
+                                  <td className="py-1 px-2 text-right">
+                                    {tr.status === 'OPEN' ? (
+                                      <button
+                                        type="button"
+                                        disabled={closingTradeId === tr.id}
+                                        onClick={() => handleCloseLiveTrade(tr.id)}
+                                        className="px-2 py-0.5 bg-rose-600/80 hover:bg-rose-600 disabled:opacity-50 text-white rounded text-[10px] font-sans font-semibold"
+                                      >
+                                        {closingTradeId === tr.id ? 'Closing...' : 'Exit'}
+                                      </button>
+                                    ) : (
+                                      <span className="text-[10px] text-slate-400">{tr.status}</span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* 2. Direct Kotak Phone App Today's Order Book (/quick/user/orders) with Exact Rejection Reason */}
+                <div className="bg-slate-950/80 border border-slate-800 rounded-md p-2.5 flex flex-col gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-semibold text-slate-200">
+                    <span>
+                      3. Direct Kotak Phone App Today&apos;s Order Book (GET /quick/user/orders — Exact COMPLETE vs REJECTED Status)
+                    </span>
+                    <span className="font-mono text-slate-400">
+                      Showing latest {Math.min(10, brokerOrders.length)} of {brokerOrders.length} orders
+                    </span>
+                  </div>
+                  {brokerOrders.length === 0 ? (
+                    <p className="text-[11px] text-slate-400 font-mono py-1">
+                      Aaj Kotak Order Book me abhi tak 0 orders aaye hain. Jab aap ya AI order bhejega, Kotak ka real Order # aur status (COMPLETE / REJECTED reason) turant yahan dikhega.
+                    </p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse text-[11px]">
+                        <thead>
+                          <tr className="text-slate-400 border-b border-slate-800">
+                            <th className="py-1 px-2">Kotak Order #</th>
+                            <th className="py-1 px-2">Time</th>
+                            <th className="py-1 px-2">Trading Symbol</th>
+                            <th className="py-1 px-2">Side</th>
+                            <th className="py-1 px-2 text-right">Qty</th>
+                            <th className="py-1 px-2 text-right">Fill Price</th>
+                            <th className="py-1 px-2">Exchange Status</th>
+                            <th className="py-1 px-2">Kotak Message / Rejection Reason</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/60 font-mono tabular-nums">
+                          {brokerOrders.slice(0, 10).map((ord, idx) => {
+                            const stUpper = ord.status.toUpperCase();
+                            const isComplete = stUpper === 'COMPLETE' || stUpper === 'TRADED';
+                            const isRejected =
+                              stUpper.includes('REJ') ||
+                              stUpper.includes('CANCEL') ||
+                              stUpper.includes('DENIED');
+                            return (
+                              <tr key={`${ord.orderId}-${idx}`} className="hover:bg-slate-900/60">
+                                <td className="py-1 px-2 text-slate-200">{ord.orderId}</td>
+                                <td className="py-1 px-2 text-slate-400">{ord.orderTime || '—'}</td>
+                                <td className="py-1 px-2 font-semibold text-white">{ord.trdSymbol}</td>
+                                <td
+                                  className={`py-1 px-2 font-semibold ${
+                                    ord.side === 'BUY' ? 'text-emerald-400' : 'text-rose-400'
+                                  }`}
+                                >
+                                  {ord.side}
+                                </td>
+                                <td className="py-1 px-2 text-right text-slate-200">{ord.qty}</td>
+                                <td className="py-1 px-2 text-right text-slate-300">
+                                  {ord.avgPrice > 0 ? ord.avgPrice : '—'}
+                                </td>
+                                <td className="py-1 px-2">
+                                  <span
+                                    className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold border ${
+                                      isComplete
+                                        ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300'
+                                        : isRejected
+                                        ? 'bg-rose-500/20 border-rose-500/50 text-rose-300'
+                                        : 'bg-amber-500/20 border-amber-500/50 text-amber-300'
+                                    }`}
+                                  >
+                                    {stUpper}
+                                  </span>
+                                </td>
+                                <td
+                                  className={`py-1 px-2 font-sans text-[11px] ${
+                                    isRejected ? 'text-rose-300' : 'text-slate-400'
+                                  }`}
+                                >
+                                  {ord.rejectionReason || (isComplete ? 'Filled on Exchange' : '—')}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
               </section>
             </>
           )}

@@ -15,17 +15,25 @@ export interface StoredLiveTrade {
   brokerOrderId: string;
   brokerMode: BrokerMode;
   symbol: TradingSymbol;
+  trdSymbol?: string;
   direction: 'BUY' | 'SELL';
   lots: number;
   entryPrice: number;
   exitPrice?: number;
   stopLoss: number;
   takeProfit: number;
+  initialStopDistance?: number;
+  breakEvenLocked?: boolean;
+  trailingActivated?: boolean;
+  targetStepCount?: number;
   pnlInr: number;
   pnlTicks: number;
   status: 'OPEN' | 'CLOSED_TP' | 'CLOSED_SL' | 'CLOSED_MANUAL';
   strategyUsed: string;
   confluenceNote?: string;
+  exchangeVerified?: boolean;
+  kotakOrderStatus?: string;
+  exchangeOrderId?: string;
   ts: number;
 }
 

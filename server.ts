@@ -9,6 +9,8 @@ import {
   AiStrategyMemoryRecord,
   BrokerMode,
   KotakAccountProfile,
+  KotakBrokerOrderSummary,
+  KotakBrokerPositionSummary,
   QuadChartSlotConfig,
   QuadTimeframe,
   ScannerOpportunity,
@@ -92,6 +94,7 @@ interface PersistentOracleVault {
     brokerOrderId: string;
     brokerMode: BrokerMode;
     symbol: TradingSymbol;
+    trdSymbol?: string;
     direction: 'BUY' | 'SELL';
     lots: number;
     entryPrice: number;
@@ -103,6 +106,9 @@ interface PersistentOracleVault {
     trailingActivated?: boolean;
     targetStepCount?: number;
     productCode?: 'MIS' | 'NRML';
+    exchangeVerified?: boolean;
+    kotakOrderStatus?: string;
+    exchangeOrderId?: string;
     pnlInr: number;
     pnlTicks: number;
     status: 'OPEN' | 'CLOSED_TP' | 'CLOSED_SL' | 'CLOSED_MANUAL';
@@ -260,7 +266,9 @@ function loadOrInitVault(): PersistentOracleVault {
                 t &&
                 t.brokerMode === 'LIVE' &&
                 typeof t.brokerOrderId === 'string' &&
-                !t.brokerOrderId.startsWith('PAPER-')
+                !t.brokerOrderId.startsWith('PAPER-') &&
+                (t.exchangeVerified === true ||
+                  String(t.confluenceNote || '').includes('[KOTAK_VERIFIED_FILL'))
             )
           : [];
 
@@ -358,7 +366,10 @@ async function startServer() {
     vault.accounts.LIVE
   );
   vault.aiMemory = hydratedFromOracle.aiMemory;
-  vault.liveTrades = hydratedFromOracle.liveTrades;
+  vault.liveTrades = hydratedFromOracle.liveTrades.filter(
+    (t) =>
+      t.exchangeVerified === true || String(t.confluenceNote || '').includes('[KOTAK_VERIFIED_FILL')
+  );
   if (hydratedFromOracle.accountMeta?.ucc && !vault.accounts.LIVE.ucc) {
     vault.accounts.LIVE.ucc = hydratedFromOracle.accountMeta.ucc;
     vault.accounts.LIVE.exchangeSegment = hydratedFromOracle.accountMeta.exchangeSegment;
@@ -376,7 +387,12 @@ async function startServer() {
         vault.aiMemory = mergeAiMemoryRecords(vault.aiMemory, remote.aiMemory);
       }
       if (remote.liveTrades.length > 0) {
-        vault.liveTrades = mergeLiveTrades(vault.liveTrades, remote.liveTrades);
+        const verifiedRemote = remote.liveTrades.filter(
+          (t) => String(t.confluenceNote || '').includes('[KOTAK_VERIFIED_FILL')
+        );
+        if (verifiedRemote.length > 0) {
+          vault.liveTrades = mergeLiveTrades(vault.liveTrades, verifiedRemote);
+        }
       }
       if (remote.accountMeta?.ucc && !vault.accounts.LIVE.ucc) {
         vault.accounts.LIVE.ucc = remote.accountMeta.ucc;
@@ -1100,6 +1116,7 @@ async function startServer() {
     quoteToken: string;
     orderSegment: 'cde_fo' | 'nse_fo' | 'mcx_fo';
     trdSymbol: string;
+    lotSize: number;
   }
 
   // Kotak Neo Live Session + Scrip Master Contract Map + Live Tick Candle Accumulator
@@ -1112,32 +1129,19 @@ async function startServer() {
     connectedAt: number;
   } | null = null;
 
-  const kotakContracts = new Map<TradingSymbol, KotakResolvedContract>([
-    [
-      'NIFTY50',
-      {
-        symbol: 'NIFTY50',
-        quoteSegment: 'nse_cm',
-        quoteToken: 'Nifty 50',
-        orderSegment: 'nse_fo',
-        trdSymbol: 'NIFTY',
-      },
-    ],
-    [
-      'BANKNIFTY',
-      {
-        symbol: 'BANKNIFTY',
-        quoteSegment: 'nse_cm',
-        quoteToken: 'Nifty Bank',
-        orderSegment: 'nse_fo',
-        trdSymbol: 'BANKNIFTY',
-      },
-    ],
-  ]);
+  const KOTAK_SPOT_QUOTE_TOKENS: Partial<
+    Record<TradingSymbol, { quoteSegment: 'nse_cm'; quoteToken: string }>
+  > = {
+    NIFTY50: { quoteSegment: 'nse_cm', quoteToken: 'Nifty 50' },
+    BANKNIFTY: { quoteSegment: 'nse_cm', quoteToken: 'Nifty Bank' },
+  };
+
+  // ONLY populated with real tradable near-month contracts resolved from Kotak Scrip Master CSVs!
+  const kotakContracts = new Map<TradingSymbol, KotakResolvedContract>();
 
   const kotakLiveCandles = new Map<TradingSymbol, Record<'30M' | '5M' | '1M' | '30S', RealCandle[]>>();
   let kotakScripMasterReady = false;
-  let kotakScripMasterLoading = false;
+  let kotakScripMasterPromise: Promise<void> | null = null;
 
   function recordKotakLiveTickBar(sym: TradingSymbol, price: number, tsMs: number) {
     const decimals = SYMBOL_FEED_MAP[sym].decimals;
@@ -1208,6 +1212,25 @@ async function startServer() {
       .slice(-220);
   }
 
+  function parseKotakCsvExpiryToUnixSec(rawExp: string): number {
+    const clean = (rawExp || '').replace(/^"|"$/g, '').trim();
+    if (!clean) return 0;
+    const num = Number(clean);
+    if (Number.isFinite(num) && num > 0) {
+      if (num > 1e12) return Math.floor(num / 1000);
+      // NSE / Kotak cde_fo & nse_fo CSV lExpiryDate is seconds since 1980-01-01 (+315532800s from 1970 Unix epoch)!
+      if (num > 800_000_000 && num < 1_650_000_000) {
+        return num + 315_532_800;
+      }
+      return num;
+    }
+    const parsedMs = Date.parse(clean);
+    if (Number.isFinite(parsedMs) && parsedMs > 0) {
+      return Math.floor(parsedMs / 1000);
+    }
+    return 0;
+  }
+
   function parseKotakMasterCsvForNearestFutures(
     csvText: string,
     segment: 'cde_fo' | 'nse_fo' | 'mcx_fo',
@@ -1223,150 +1246,171 @@ async function startServer() {
       (h) => h === 'psymbolname' || h === 'p_symbolname' || h === 'pscriprefkey'
     );
     const idxExp = headers.findIndex((h) => h.includes('expiry'));
+    const idxLot = headers.findIndex(
+      (h) => h.includes('lotsize') || h === 'llotsize' || h === 'ilotsize' || h === 'p_lotsize'
+    );
     if (idxSym < 0 || idxTrd < 0) return;
 
     const nowSec = Math.floor(Date.now() / 1000);
-    const best = new Map<TradingSymbol, { expiry: number; pSymbol: string; trdSymbol: string }>();
+    const bestFuture = new Map<
+      TradingSymbol,
+      { expiry: number; pSymbol: string; trdSymbol: string; lotSize: number }
+    >();
+    const fallbackNearest = new Map<
+      TradingSymbol,
+      { expiry: number; pSymbol: string; trdSymbol: string; lotSize: number }
+    >();
 
     for (let i = 1; i < lines.length; i++) {
       const line = lines[i];
       if (!line) continue;
       const cols = line.split(',');
       if (cols.length <= Math.max(idxSym, idxTrd)) continue;
-      const inst = (idxInst >= 0 ? cols[idxInst] : '').trim().toUpperCase();
-      const trd = (cols[idxTrd] || '').trim().toUpperCase();
-      const name = (idxName >= 0 ? cols[idxName] : '').trim().toUpperCase();
-      const pSym = (cols[idxSym] || '').trim();
+      const inst = (idxInst >= 0 ? cols[idxInst] : '').replace(/^"|"$/g, '').trim().toUpperCase();
+      const trd = (cols[idxTrd] || '').replace(/^"|"$/g, '').trim().toUpperCase();
+      const name = (idxName >= 0 ? cols[idxName] : '').replace(/^"|"$/g, '').trim().toUpperCase();
+      const pSym = (cols[idxSym] || '').replace(/^"|"$/g, '').trim();
       if (!pSym || !trd) continue;
 
       for (const t of targets) {
         if (idxInst >= 0 && t.instTypes.length > 0 && !t.instTypes.includes(inst)) continue;
         const matchesName = t.prefixes.some((p) => {
-          if (name === p) return true;
+          if (name === p && trd.endsWith('FUT')) return true;
           if (!trd.startsWith(p) || !trd.endsWith('FUT')) return false;
-          // Ensure GOLD prefix does not accidentally match GOLDM or GOLDPETAL
           const nextChar = trd.charAt(p.length);
           return /\d/.test(nextChar);
         });
         if (!matchesName) continue;
 
-        let expNum = Number(idxExp >= 0 ? cols[idxExp] : 0);
-        if (!Number.isFinite(expNum) || expNum <= 0) expNum = nowSec + 86400 * 30;
-        if (expNum > 1e12) expNum = Math.floor(expNum / 1000);
-        if (expNum < nowSec - 86400) continue;
+        const expSec = parseKotakCsvExpiryToUnixSec(idxExp >= 0 ? cols[idxExp] : '');
+        const lotRaw = idxLot >= 0 ? Number((cols[idxLot] || '').replace(/^"|"$/g, '').trim()) : 1;
+        const lotSize = Number.isFinite(lotRaw) && lotRaw >= 1 ? Math.round(lotRaw) : 1;
 
-        const prev = best.get(t.sym);
-        if (!prev || expNum < prev.expiry) {
-          best.set(t.sym, { expiry: expNum, pSymbol: pSym, trdSymbol: trd });
+        if (expSec >= nowSec - 86400) {
+          const prev = bestFuture.get(t.sym);
+          if (!prev || expSec < prev.expiry) {
+            bestFuture.set(t.sym, { expiry: expSec, pSymbol: pSym, trdSymbol: trd, lotSize });
+          }
+        } else if (expSec > 0) {
+          // Clock-skew safety fallback (e.g., sandbox clock vs live exchange year)
+          const prevFb = fallbackNearest.get(t.sym);
+          if (!prevFb || expSec < prevFb.expiry) {
+            fallbackNearest.set(t.sym, { expiry: expSec, pSymbol: pSym, trdSymbol: trd, lotSize });
+          }
         }
       }
     }
 
-    for (const [sym, found] of best.entries()) {
+    for (const t of targets) {
+      const found = bestFuture.get(t.sym) ?? fallbackNearest.get(t.sym);
+      if (!found) continue;
       if (segment === 'cde_fo' || segment === 'mcx_fo') {
-        kotakContracts.set(sym, {
-          symbol: sym,
+        kotakContracts.set(t.sym, {
+          symbol: t.sym,
           quoteSegment: segment,
           quoteToken: found.pSymbol,
           orderSegment: segment,
           trdSymbol: found.trdSymbol,
+          lotSize: found.lotSize,
         });
       } else {
-        // Keep nse_cm index quote for NIFTY50/BANKNIFTY spot, update order trdSymbol to live near-month FUT
-        const existing = kotakContracts.get(sym);
-        kotakContracts.set(sym, {
-          symbol: sym,
-          quoteSegment: existing?.quoteSegment ?? 'nse_cm',
-          quoteToken: existing?.quoteToken ?? (sym === 'NIFTY50' ? 'Nifty 50' : 'Nifty Bank'),
+        const spot = KOTAK_SPOT_QUOTE_TOKENS[t.sym];
+        kotakContracts.set(t.sym, {
+          symbol: t.sym,
+          quoteSegment: spot?.quoteSegment ?? 'nse_fo',
+          quoteToken: spot?.quoteToken ?? found.pSymbol,
           orderSegment: 'nse_fo',
           trdSymbol: found.trdSymbol,
+          lotSize: found.lotSize,
         });
       }
     }
   }
 
   async function initializeKotakScripMaster(session: NonNullable<typeof liveBrokerSession>) {
-    if (kotakScripMasterLoading) return;
-    kotakScripMasterLoading = true;
-    try {
-      const resp = await fetch(`${session.baseUrl}/script-details/1.0/masterscrip/file-paths`, {
-        headers: {
-          Authorization: session.consumerKey,
-          Accept: 'application/json',
-        },
-        signal: AbortSignal.timeout(7000),
-      });
-      if (!resp.ok) return;
-      const json = (await resp.json()) as {
-        data?: { filesPaths?: string[] };
-        filesPaths?: string[];
-      };
-      const paths = json?.data?.filesPaths ?? json?.filesPaths ?? [];
-      if (!Array.isArray(paths) || paths.length === 0) return;
+    if (kotakScripMasterPromise) return kotakScripMasterPromise;
+    kotakScripMasterPromise = (async () => {
+      try {
+        const resp = await fetch(`${session.baseUrl}/script-details/1.0/masterscrip/file-paths`, {
+          headers: {
+            Authorization: session.consumerKey,
+            Accept: 'application/json',
+          },
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!resp.ok) return;
+        const json = (await resp.json()) as {
+          data?: { filesPaths?: string[] };
+          filesPaths?: string[];
+        };
+        const paths = json?.data?.filesPaths ?? json?.filesPaths ?? [];
+        if (!Array.isArray(paths) || paths.length === 0) return;
 
-      const cdeUrl = paths.find((u) => u.includes('cde_fo.csv'));
-      const nfoUrl = paths.find((u) => u.includes('nse_fo.csv'));
-      const mcxUrl = paths.find((u) => u.includes('mcx_fo.csv'));
+        const cdeUrl = paths.find((u) => u.includes('cde_fo.csv'));
+        const nfoUrl = paths.find((u) => u.includes('nse_fo.csv'));
+        const mcxUrl = paths.find((u) => u.includes('mcx_fo.csv'));
 
-      const tasks: Promise<void>[] = [];
-      if (cdeUrl) {
-        tasks.push(
-          fetch(cdeUrl, { signal: AbortSignal.timeout(9000) })
-            .then((r) => (r.ok ? r.text() : ''))
-            .then((csv) => {
-              if (!csv) return;
-              parseKotakMasterCsvForNearestFutures(csv, 'cde_fo', [
-                { sym: 'USDINR', prefixes: ['USDINR'], instTypes: ['FUTCUR'] },
-                { sym: 'EURINR', prefixes: ['EURINR'], instTypes: ['FUTCUR'] },
-                { sym: 'GBPINR', prefixes: ['GBPINR'], instTypes: ['FUTCUR'] },
-                { sym: 'JPYINR', prefixes: ['JPYINR'], instTypes: ['FUTCUR'] },
-                { sym: 'EURUSD', prefixes: ['EURUSD'], instTypes: ['FUTCUR'] },
-                { sym: 'GBPUSD', prefixes: ['GBPUSD'], instTypes: ['FUTCUR'] },
-                { sym: 'USDJPY', prefixes: ['USDJPY'], instTypes: ['FUTCUR'] },
-              ]);
-            })
-            .catch(() => {})
-        );
+        const tasks: Promise<void>[] = [];
+        if (cdeUrl) {
+          tasks.push(
+            fetch(cdeUrl, { signal: AbortSignal.timeout(12000) })
+              .then((r) => (r.ok ? r.text() : ''))
+              .then((csv) => {
+                if (!csv) return;
+                parseKotakMasterCsvForNearestFutures(csv, 'cde_fo', [
+                  { sym: 'USDINR', prefixes: ['USDINR'], instTypes: ['FUTCUR'] },
+                  { sym: 'EURINR', prefixes: ['EURINR'], instTypes: ['FUTCUR'] },
+                  { sym: 'GBPINR', prefixes: ['GBPINR'], instTypes: ['FUTCUR'] },
+                  { sym: 'JPYINR', prefixes: ['JPYINR'], instTypes: ['FUTCUR'] },
+                  { sym: 'EURUSD', prefixes: ['EURUSD'], instTypes: ['FUTCUR'] },
+                  { sym: 'GBPUSD', prefixes: ['GBPUSD'], instTypes: ['FUTCUR'] },
+                  { sym: 'USDJPY', prefixes: ['USDJPY'], instTypes: ['FUTCUR'] },
+                ]);
+              })
+              .catch(() => {})
+          );
+        }
+        if (nfoUrl) {
+          tasks.push(
+            fetch(nfoUrl, { signal: AbortSignal.timeout(12000) })
+              .then((r) => (r.ok ? r.text() : ''))
+              .then((csv) => {
+                if (!csv) return;
+                parseKotakMasterCsvForNearestFutures(csv, 'nse_fo', [
+                  { sym: 'NIFTY50', prefixes: ['NIFTY'], instTypes: ['FUTIDX'] },
+                  { sym: 'BANKNIFTY', prefixes: ['BANKNIFTY'], instTypes: ['FUTIDX'] },
+                  { sym: 'FINNIFTY', prefixes: ['FINNIFTY'], instTypes: ['FUTIDX'] },
+                ]);
+              })
+              .catch(() => {})
+          );
+        }
+        if (mcxUrl) {
+          tasks.push(
+            fetch(mcxUrl, { signal: AbortSignal.timeout(14000) })
+              .then((r) => (r.ok ? r.text() : ''))
+              .then((csv) => {
+                if (!csv) return;
+                parseKotakMasterCsvForNearestFutures(csv, 'mcx_fo', [
+                  { sym: 'GOLDPETAL', prefixes: ['GOLDPETAL'], instTypes: ['FUTCOM'] },
+                  { sym: 'GOLDM', prefixes: ['GOLDM'], instTypes: ['FUTCOM'] },
+                  { sym: 'GOLD', prefixes: ['GOLD'], instTypes: ['FUTCOM'] },
+                  { sym: 'SILVERMIC', prefixes: ['SILVERMIC'], instTypes: ['FUTCOM'] },
+                  { sym: 'CRUDEOILM', prefixes: ['CRUDEOILM'], instTypes: ['FUTCOM'] },
+                ]);
+              })
+              .catch(() => {})
+          );
+        }
+        await Promise.all(tasks);
+        kotakScripMasterReady = kotakContracts.size > 0;
+      } catch {
+        // Non-fatal
+      } finally {
+        kotakScripMasterPromise = null;
       }
-      if (nfoUrl) {
-        tasks.push(
-          fetch(nfoUrl, { signal: AbortSignal.timeout(9000) })
-            .then((r) => (r.ok ? r.text() : ''))
-            .then((csv) => {
-              if (!csv) return;
-              parseKotakMasterCsvForNearestFutures(csv, 'nse_fo', [
-                { sym: 'NIFTY50', prefixes: ['NIFTY'], instTypes: ['FUTIDX'] },
-                { sym: 'BANKNIFTY', prefixes: ['BANKNIFTY'], instTypes: ['FUTIDX'] },
-                { sym: 'FINNIFTY', prefixes: ['FINNIFTY'], instTypes: ['FUTIDX'] },
-              ]);
-            })
-            .catch(() => {})
-        );
-      }
-      if (mcxUrl) {
-        tasks.push(
-          fetch(mcxUrl, { signal: AbortSignal.timeout(10000) })
-            .then((r) => (r.ok ? r.text() : ''))
-            .then((csv) => {
-              if (!csv) return;
-              parseKotakMasterCsvForNearestFutures(csv, 'mcx_fo', [
-                { sym: 'GOLDPETAL', prefixes: ['GOLDPETAL'], instTypes: ['FUTCOM'] },
-                { sym: 'GOLDM', prefixes: ['GOLDM'], instTypes: ['FUTCOM'] },
-                { sym: 'GOLD', prefixes: ['GOLD'], instTypes: ['FUTCOM'] },
-                { sym: 'SILVERMIC', prefixes: ['SILVERMIC'], instTypes: ['FUTCOM'] },
-                { sym: 'CRUDEOILM', prefixes: ['CRUDEOILM'], instTypes: ['FUTCOM'] },
-              ]);
-            })
-            .catch(() => {})
-        );
-      }
-      await Promise.all(tasks);
-      kotakScripMasterReady = true;
-    } catch {
-      // Non-fatal: NIFTY50 & BANKNIFTY index quotes still work immediately via nse_cm|Nifty 50
-    } finally {
-      kotakScripMasterLoading = false;
-    }
+    })();
+    return kotakScripMasterPromise;
   }
 
   const quadCache = new Map<TradingSymbol, { expiresAt: number; payload: QuadPayload }>();
@@ -1785,11 +1829,29 @@ async function startServer() {
     if (Date.now() - lastKotakQuotePollAt < 650) return handled;
     lastKotakQuotePollAt = Date.now();
 
-    const queryItems: Array<{ sym: TradingSymbol; contract: KotakResolvedContract; tokenStr: string }> = [];
+    const queryItems: Array<{
+      sym: TradingSymbol;
+      quoteToken: string;
+      displayHint: string;
+      tokenStr: string;
+    }> = [];
     for (const sym of activeSyms) {
       const c = kotakContracts.get(sym);
+      const spot = KOTAK_SPOT_QUOTE_TOKENS[sym];
       if (c) {
-        queryItems.push({ sym, contract: c, tokenStr: `${c.quoteSegment}|${c.quoteToken}` });
+        queryItems.push({
+          sym,
+          quoteToken: c.quoteToken,
+          displayHint: c.trdSymbol,
+          tokenStr: `${c.quoteSegment}|${c.quoteToken}`,
+        });
+      } else if (spot) {
+        queryItems.push({
+          sym,
+          quoteToken: spot.quoteToken,
+          displayHint: spot.quoteToken,
+          tokenStr: `${spot.quoteSegment}|${spot.quoteToken}`,
+        });
       }
     }
     if (queryItems.length === 0) return handled;
@@ -1828,8 +1890,8 @@ async function startServer() {
         const matched =
           queryItems.find(
             (q) =>
-              String(row.exchange_token || '').toLowerCase() === q.contract.quoteToken.toLowerCase() ||
-              String(row.display_symbol || '').toUpperCase().includes(q.contract.trdSymbol)
+              String(row.exchange_token || '').toLowerCase() === q.quoteToken.toLowerCase() ||
+              String(row.display_symbol || '').toUpperCase().includes(q.displayHint.toUpperCase())
           ) ?? queryItems[i];
         if (!matched) continue;
 
@@ -1857,7 +1919,7 @@ async function startServer() {
           source: 'KOTAK_NEO_LIVE',
           latencyMs: lat,
           ts: now,
-          contractSymbol: row.display_symbol || matched.contract.trdSymbol,
+          contractSymbol: row.display_symbol || matched.displayHint,
           marketStatus: nseOpen ? 'NSE_LIVE' : 'NSE_CLOSED',
         });
         handled.add(matched.sym);
@@ -2211,11 +2273,13 @@ async function startServer() {
   // ---------------------------------------------------------------------------
   let lastServerBotAction: string | null = null;
   const botDiagnostics = new Map<TradingSymbol, string>();
+  let latestBrokerOrders: KotakBrokerOrderSummary[] = [];
+  let latestBrokerPositions: KotakBrokerPositionSummary[] = [];
 
   app.get('/api/kotak/status', (_req, res) => {
     const resolvedContracts: Record<string, string> = {};
     for (const [sym, c] of kotakContracts.entries()) {
-      resolvedContracts[sym] = c.trdSymbol;
+      resolvedContracts[sym] = `${c.trdSymbol} (Lot:${c.lotSize})`;
     }
     const diagObj: Record<string, string> = {};
     for (const [sym, msg] of botDiagnostics.entries()) {
@@ -2232,6 +2296,8 @@ async function startServer() {
       liveSessionActive: Boolean(liveBrokerSession),
       kotakScripMasterReady,
       kotakContracts: resolvedContracts,
+      brokerOrders: latestBrokerOrders,
+      brokerPositions: latestBrokerPositions,
       lastUcc: vault.accounts.LIVE.ucc || '',
       accounts: vault.accounts,
       aiMemory: vault.aiMemory,
@@ -2286,6 +2352,9 @@ async function startServer() {
   app.post('/api/kotak/disconnect', (_req, res) => {
     liveBrokerSession = null;
     kotakScripMasterReady = false;
+    kotakContracts.clear();
+    latestBrokerOrders = [];
+    latestBrokerPositions = [];
     quadCache.clear();
     botDiagnostics.clear();
     vault.activeMode = 'LIVE';
@@ -2458,10 +2527,7 @@ async function startServer() {
     void fetchKotakLiveMarginDetails(liveBrokerSession)
       .then((res) => {
         if (!res || !liveBrokerSession) return;
-        const openUnrealized = vault.liveTrades
-          .filter((t) => t.status === 'OPEN')
-          .reduce((s, t) => s + (Number(t.pnlInr) || 0), 0);
-        const nextEquity = Number(Math.max(0, res.availableInr + res.usedMarginInr + openUnrealized).toFixed(2));
+        const nextEquity = Number(Math.max(0, res.availableInr + res.usedMarginInr).toFixed(2));
         if (
           Math.abs(vault.accounts.LIVE.balanceInr - res.availableInr) >= 0.5 ||
           Math.abs((vault.accounts.LIVE.usedMarginInr ?? 0) - res.usedMarginInr) >= 0.5
@@ -2619,14 +2685,16 @@ async function startServer() {
         connectedAt: Date.now(),
       };
 
-      // Fetch real Kotak margin limits + bootstrap Scrip Master (NSE CDS, NSE FO & MCX Gold/Silver/Crude) in parallel
+      // Fetch real Kotak margin limits + bootstrap Scrip Master + reconcile real Kotak positions/orders
       quadCache.clear();
+      kotakContracts.clear();
       const [fetchedMargin] = await Promise.all([
         fetchKotakLiveMarginDetails(liveBrokerSession),
         Promise.race([
           initializeKotakScripMaster(liveBrokerSession),
-          new Promise<void>((resolve) => setTimeout(resolve, 2800)),
+          new Promise<void>((resolve) => setTimeout(resolve, 4500)),
         ]),
+        reconcileWithKotakBrokerBook(liveBrokerSession),
       ]);
       void pollKotakNeoLiveQuotes([
         'USDINR',
@@ -2674,7 +2742,7 @@ async function startServer() {
 
       const resolvedContracts: Record<string, string> = {};
       for (const [sym, c] of kotakContracts.entries()) {
-        resolvedContracts[sym] = c.trdSymbol;
+        resolvedContracts[sym] = `${c.trdSymbol} (Lot:${c.lotSize})`;
       }
 
       res.json({
@@ -2682,6 +2750,8 @@ async function startServer() {
         account: updatedAccount,
         accounts: vault.accounts,
         kotakContracts: resolvedContracts,
+        brokerOrders: latestBrokerOrders,
+        brokerPositions: latestBrokerPositions,
       });
     } catch (err) {
       res.status(502).json({
@@ -2716,6 +2786,153 @@ async function startServer() {
     res.json({ success: true, account: vault.accounts.LIVE });
   });
 
+  async function fetchRawKotakOrders(
+    session: NonNullable<typeof liveBrokerSession>
+  ): Promise<Array<Record<string, unknown>>> {
+    const resp = await fetch(`${session.baseUrl}/quick/user/orders`, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Auth: session.tradingToken,
+        Sid: session.tradingSid,
+        'neo-fin-key': 'neotradeapi',
+      },
+      signal: AbortSignal.timeout(6500),
+    });
+    if (!resp.ok) return [];
+    const data = (await resp.json().catch(() => ({}))) as {
+      data?: Array<Record<string, unknown>>;
+    };
+    return Array.isArray(data.data) ? data.data : [];
+  }
+
+  async function fetchRawKotakPositions(
+    session: NonNullable<typeof liveBrokerSession>
+  ): Promise<{ ok: boolean; rows: Array<Record<string, unknown>> }> {
+    try {
+      const resp = await fetch(`${session.baseUrl}/quick/user/positions`, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Auth: session.tradingToken,
+          Sid: session.tradingSid,
+          'neo-fin-key': 'neotradeapi',
+        },
+        signal: AbortSignal.timeout(6500),
+      });
+      if (!resp.ok) return { ok: false, rows: [] };
+      const data = (await resp.json().catch(() => ({}))) as {
+        data?: Array<Record<string, unknown>>;
+        stat?: string;
+        errMsg?: string;
+      };
+      // In Kotak Neo, "No Data" means 0 positions exist right now (valid empty book!)
+      if (Array.isArray(data.data)) {
+        return { ok: true, rows: data.data };
+      }
+      const msg = String(data.errMsg || data.stat || '').toLowerCase();
+      if (msg.includes('no data') || msg.includes('nodata') || data.stat === 'Ok') {
+        return { ok: true, rows: [] };
+      }
+      return { ok: false, rows: [] };
+    } catch {
+      return { ok: false, rows: [] };
+    }
+  }
+
+  function mapKotakOrderSummary(raw: Record<string, unknown>): KotakBrokerOrderSummary {
+    const sideStr = String(raw.trnsTp ?? raw.tt ?? 'B').toUpperCase();
+    return {
+      orderId: String(raw.nOrdNo ?? raw.ordNo ?? ''),
+      trdSymbol: String(raw.trdSym ?? raw.ts ?? raw.sym ?? ''),
+      side: sideStr === 'S' || sideStr === 'SELL' ? 'SELL' : 'BUY',
+      qty: parseKotakNumber(raw.qty ?? raw.qt) ?? 0,
+      status: String(raw.ordSt ?? raw.stat ?? 'unknown').toUpperCase(),
+      avgPrice: parseKotakNumber(raw.avgPrc ?? raw.prc) ?? 0,
+      rejectionReason: String(raw.rejRsn ?? raw.text ?? raw.errMsg ?? '').trim(),
+      orderTime: String(raw.ordDtTm ?? raw.exTm ?? ''),
+    };
+  }
+
+  function mapKotakPositionSummary(raw: Record<string, unknown>): KotakBrokerPositionSummary {
+    const flBuyQty = parseKotakNumber(raw.flBuyQty ?? raw.cfBuyQty) ?? 0;
+    const flSellQty = parseKotakNumber(raw.flSellQty ?? raw.cfSellQty) ?? 0;
+    const explicitNet = parseKotakNumber(raw.netQty);
+    const netQty = explicitNet !== null ? explicitNet : flBuyQty - flSellQty;
+    const buyAmt = parseKotakNumber(raw.buyAmt ?? raw.totBuyAmt) ?? 0;
+    const sellAmt = parseKotakNumber(raw.sellAmt ?? raw.totSellAmt) ?? 0;
+    const ltp = parseKotakNumber(raw.ltp ?? raw.stkPrc) ?? 0;
+    const lotMul = parseKotakNumber(raw.genNum) ?? 1;
+    const pnlInr = Number((sellAmt - buyAmt + netQty * ltp * lotMul).toFixed(2));
+    return {
+      trdSymbol: String(raw.trdSym ?? raw.ts ?? raw.sym ?? ''),
+      exchangeSegment: String(raw.exSeg ?? raw.es ?? ''),
+      product: String(raw.prod ?? raw.pc ?? ''),
+      netQty,
+      buyAmt,
+      sellAmt,
+      ltp,
+      pnlInr: Number.isFinite(pnlInr) ? pnlInr : 0,
+    };
+  }
+
+  let reconcileBusy = false;
+  async function reconcileWithKotakBrokerBook(session: NonNullable<typeof liveBrokerSession>) {
+    if (reconcileBusy) return;
+    reconcileBusy = true;
+    try {
+      const [rawOrders, posRes] = await Promise.all([
+        fetchRawKotakOrders(session).catch(() => []),
+        fetchRawKotakPositions(session),
+      ]);
+      latestBrokerOrders = rawOrders.map(mapKotakOrderSummary).slice(0, 20);
+      if (posRes.ok) {
+        latestBrokerPositions = posRes.rows.map(mapKotakPositionSummary);
+      }
+
+      // Auto-reconcile vault.liveTrades so NO ghost or externally-squared-off trade ever stays OPEN!
+      let changed = false;
+      const now = Date.now();
+      vault.liveTrades = vault.liveTrades.filter((tr) => {
+        if (tr.status !== 'OPEN') return true;
+        // 1. Check if the brokerOrderId was actually REJECTED or CANCELLED in Kotak Order Book
+        const matchedOrd = latestBrokerOrders.find((o) => o.orderId === tr.brokerOrderId);
+        if (matchedOrd) {
+          const st = matchedOrd.status.toLowerCase();
+          if (st.includes('rej') || st.includes('cancel')) {
+            changed = true;
+            return false; // Purge rejected order from liveTrades completely!
+          }
+        }
+        // 2. If trade is older than 8s and Kotak Positions book is confirmed valid, verify netQty != 0!
+        if (posRes.ok && now - tr.ts > 8000) {
+          const trContract = (tr.trdSymbol || kotakContracts.get(tr.symbol)?.trdSymbol || tr.symbol).toUpperCase();
+          const hasLiveKotakPos = latestBrokerPositions.some(
+            (p) => p.netQty !== 0 && p.trdSymbol.toUpperCase() === trContract
+          );
+          if (!hasLiveKotakPos) {
+            tr.status = 'CLOSED_MANUAL';
+            tr.kotakOrderStatus = 'SQUARED_OFF_ON_KOTAK';
+            changed = true;
+          }
+        }
+        return true;
+      });
+
+      if (changed) {
+        saveVault(vault);
+      }
+    } finally {
+      reconcileBusy = false;
+    }
+  }
+
+  // Reconcile against real Kotak Phone App Positions & Order Book every 10s while connected
+  setInterval(() => {
+    if (!liveBrokerSession || vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED') return;
+    void reconcileWithKotakBrokerBook(liveBrokerSession);
+  }, 10_000);
+
   app.get('/api/kotak/orders', async (_req, res) => {
     if (!liveBrokerSession || vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED') {
       res.status(401).json({
@@ -2724,37 +2941,128 @@ async function startServer() {
       return;
     }
     try {
-      const resp = await fetch(`${liveBrokerSession.baseUrl}/quick/user/orders`, {
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          Auth: liveBrokerSession.tradingToken,
-          Sid: liveBrokerSession.tradingSid,
-          'neo-fin-key': 'neotradeapi',
-        },
-        signal: AbortSignal.timeout(7000),
+      await reconcileWithKotakBrokerBook(liveBrokerSession);
+      res.json({
+        success: true,
+        orders: latestBrokerOrders,
+        positions: latestBrokerPositions,
       });
-      const data = (await resp.json().catch(() => ({}))) as {
-        data?: Array<Record<string, unknown>>;
-        stat?: string;
-        errMsg?: string;
-      };
-      if (!resp.ok) {
-        res.status(resp.status).json({
-          error: data.errMsg || `Kotak Orders API error (HTTP ${resp.status})`,
-          orders: [],
-        });
-        return;
-      }
-      const orders = Array.isArray(data.data) ? data.data : [];
-      res.json({ success: true, orders });
     } catch (err) {
       res.status(502).json({
         error: `Kotak Orders fetch error: ${err instanceof Error ? err.message : 'Timeout'}`,
         orders: [],
+        positions: [],
       });
     }
   });
+
+  /**
+   * CRITICAL REAL-EXCHANGE VERIFICATION GATE:
+   * Kotak /quick/order/rule/ms/place returns an nOrdNo even when RMS/Exchange rejects the order 150ms later!
+   * This function polls Kotak /quick/user/orders to verify the order is ACTUALLY TRADED/COMPLETE on NSE/MCX!
+   */
+  async function verifyKotakOrderExecution(
+    session: NonNullable<typeof liveBrokerSession>,
+    nOrdNo: string
+  ): Promise<
+    | {
+        verified: true;
+        orderId: string;
+        exOrdId: string;
+        fillPrice: number | null;
+        filledQty: number;
+        status: string;
+      }
+    | {
+        verified: false;
+        orderId: string;
+        status: string;
+        reason: string;
+        fatalNonRetryable: boolean;
+      }
+  > {
+    const waitStepsMs = [300, 550, 750, 950];
+    let lastSeenRow: Record<string, unknown> | undefined;
+
+    for (const delay of waitStepsMs) {
+      await new Promise((r) => setTimeout(r, delay));
+      const orders = await fetchRawKotakOrders(session).catch(() => []);
+      if (orders.length > 0) {
+        latestBrokerOrders = orders.map(mapKotakOrderSummary).slice(0, 20);
+      }
+      const row = orders.find((o) => String(o.nOrdNo ?? o.ordNo ?? '') === String(nOrdNo));
+      if (!row) continue;
+      lastSeenRow = row;
+
+      const ordSt = String(row.ordSt ?? row.stat ?? '').trim().toLowerCase();
+      const fldQty = parseKotakNumber(row.fldQty) ?? 0;
+
+      if (ordSt === 'complete' || ordSt === 'traded' || fldQty > 0) {
+        return {
+          verified: true,
+          orderId: nOrdNo,
+          exOrdId: String(row.exOrdId ?? row.GuiOrdId ?? nOrdNo),
+          fillPrice: parseKotakNumber(row.avgPrc ?? row.prc),
+          filledQty: fldQty,
+          status: 'COMPLETE',
+        };
+      }
+
+      if (ordSt.includes('rej') || ordSt.includes('cancel') || ordSt.includes('denied')) {
+        const rejRsn = String(
+          row.rejRsn ?? row.text ?? row.errMsg ?? row.ordSt ?? 'Rejected by Kotak RMS / Exchange'
+        ).trim();
+        const lowerRsn = rejRsn.toLowerCase();
+        const fatalNonRetryable =
+          lowerRsn.includes('closed') ||
+          lowerRsn.includes('logged off') ||
+          lowerRsn.includes('adapter') ||
+          lowerRsn.includes('segment') ||
+          lowerRsn.includes('holiday') ||
+          lowerRsn.includes('freeze');
+        return {
+          verified: false,
+          orderId: nOrdNo,
+          status: ordSt.toUpperCase(),
+          reason: rejRsn,
+          fatalNonRetryable,
+        };
+      }
+    }
+
+    // Order exists in Kotak Order Book but did NOT execute within ~2.6s (e.g., pending / market closed / AMO)
+    try {
+      await fetch(`${session.baseUrl}/quick/order/cancel`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          Auth: session.tradingToken,
+          Sid: session.tradingSid,
+          'neo-fin-key': 'neotradeapi',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({ jData: JSON.stringify({ on: nOrdNo, am: 'NO' }) }).toString(),
+        signal: AbortSignal.timeout(4000),
+      });
+    } catch {
+      // Best-effort cancel of unfilled MKT order
+    }
+
+    const pendingStatus = lastSeenRow
+      ? String(lastSeenRow.ordSt ?? lastSeenRow.stat ?? 'PENDING').toUpperCase()
+      : 'UNCONFIRMED';
+    const pendingReason = lastSeenRow
+      ? String(lastSeenRow.rejRsn ?? lastSeenRow.text ?? `Order Status is ${pendingStatus} (not filled)`).trim()
+      : 'Kotak Order Book me fill confirmation nahi mila';
+
+    return {
+      verified: false,
+      orderId: nOrdNo,
+      status: pendingStatus,
+      reason: pendingReason,
+      fatalNonRetryable: true,
+    };
+  }
 
   const orderInFlightBySymbol = new Set<TradingSymbol>();
   const closeInFlightByTradeId = new Set<string>();
@@ -2796,31 +3104,49 @@ async function startServer() {
       const spec = INDIAN_SYMBOLS[cleanSym];
       const cleanDir: 'BUY' | 'SELL' = params.direction === 'SELL' ? 'SELL' : 'BUY';
 
-      // Refresh margin right before order if cached balance is 0 so fresh deposits are recognized immediately
-      if (acc.balanceInr <= 0 && liveBrokerSession) {
-        const freshLimits = await fetchKotakLiveMarginDetails(liveBrokerSession);
-        if (freshLimits && freshLimits.availableInr > 0) {
-          acc.balanceInr = freshLimits.availableInr;
-          acc.equityInr = Number((freshLimits.availableInr + freshLimits.usedMarginInr).toFixed(2));
-          acc.usedMarginInr = freshLimits.usedMarginInr;
-        }
+      // Ensure Scrip Master contracts are loaded before placing any real order!
+      if (!kotakContracts.has(cleanSym)) {
+        await initializeKotakScripMaster(liveBrokerSession);
       }
 
-      // Anti-Rejection Margin Guard: size lots strictly within 88% of available Kotak INR balance
-      let cleanLots = Math.max(1, Math.round(Number(params.lots) || 1));
-      if (acc.balanceInr > 0) {
-        const maxAffordableLots = Math.floor((acc.balanceInr * 0.88) / spec.marginPerLotInr);
-        if (maxAffordableLots < 1 && acc.balanceInr < spec.marginPerLotInr * 0.82) {
+      const resolved = kotakContracts.get(cleanSym);
+      if (!resolved && !params.tradingSymbolOverride) {
+        if (spec.exchange === 'GLOBAL_FX') {
           return {
             ok: false,
             status: 400,
-            error: `Margin Guard: Available ₹${acc.balanceInr.toFixed(0)}, jabki ${cleanSym} ke 1 Lot ke liye ~₹${spec.marginPerLotInr} chahiye (Rejection se bachaya gaya). GOLDPETAL (~₹1,100) ya USDINR (~₹2,450) chunein!`,
+            error: `'${cleanSym}' Global Spot chart hai — Kotak Securities India par tradable nahi hai! Real order ke liye GOLDPETAL, GOLDM, USDINR, EURINR, GBPINR, JPYINR, NIFTY50 ya BANKNIFTY chunein.`,
+          };
+        }
+        return {
+          ok: false,
+          status: 400,
+          error: `Kotak Scrip Master me '${cleanSym}' ka active futures contract nahi mila. Check karein ki aapke Kotak Neo account me ${spec.exchange} segment enabled hai.`,
+        };
+      }
+
+      // Refresh real Kotak balance right before order
+      const freshLimits = await fetchKotakLiveMarginDetails(liveBrokerSession);
+      if (freshLimits) {
+        acc.balanceInr = freshLimits.availableInr;
+        acc.equityInr = Number((freshLimits.availableInr + freshLimits.usedMarginInr).toFixed(2));
+        acc.usedMarginInr = freshLimits.usedMarginInr;
+      }
+
+      // Anti-Rejection Margin Guard: size lots strictly within 88% of real available Kotak INR balance
+      let cleanLots = Math.max(1, Math.round(Number(params.lots) || 1));
+      if (acc.balanceInr > 0) {
+        const maxAffordableLots = Math.floor((acc.balanceInr * 0.88) / spec.marginPerLotInr);
+        if (maxAffordableLots < 1 && acc.balanceInr < spec.marginPerLotInr * 0.75) {
+          return {
+            ok: false,
+            status: 400,
+            error: `Insufficient Kotak Margin: Available ₹${acc.balanceInr.toFixed(2)}, jabki ${cleanSym} (${resolved?.trdSymbol ?? cleanSym}) ke 1 Lot ke liye ~₹${spec.marginPerLotInr} chahiye. GOLDPETAL (~₹1,100) ya USDINR (~₹2,450) try karein!`,
           };
         }
         cleanLots = Math.max(1, Math.min(cleanLots, Math.max(1, maxAffordableLots)));
       }
 
-      const resolved = kotakContracts.get(cleanSym);
       const exchSeg =
         resolved?.orderSegment ??
         (spec.exchange === 'MCX_FO'
@@ -2828,30 +3154,29 @@ async function startServer() {
           : spec.exchange === 'NSE_FNO' || acc.exchangeSegment === 'NSE_FO'
           ? 'nse_fo'
           : 'cde_fo');
-      const defaultContract =
-        resolved?.trdSymbol ??
-        (cleanSym === 'NIFTY50'
-          ? 'NIFTY'
-          : cleanSym === 'BANKNIFTY'
-          ? 'BANKNIFTY'
-          : cleanSym);
-      const kotakTs = String(params.tradingSymbolOverride || defaultContract).trim().toUpperCase();
+      const kotakTs = String(params.tradingSymbolOverride || resolved!.trdSymbol).trim().toUpperCase();
+      const csvLotMult = resolved?.lotSize ?? 1;
 
-      // Smart Anti-Rejection Attempt Sequence:
-      // 1. Try MIS with calculated margin-safe lots
-      // 2. If rejected & lots > 1, immediately retry MIS with 1 lot
-      // 3. If product MIS is disallowed on contract (common on certain MCX/CDS contracts), retry NRML with 1 lot
-      const attemptConfigs: Array<{ pc: 'MIS' | 'NRML'; lots: number }> = [
-        { pc: 'MIS', lots: cleanLots },
+      // Build smart attempt sequence (exact CSV lotSize quantity, 1-lot fallback, NRML product fallback)
+      const attemptConfigs: Array<{ pc: 'MIS' | 'NRML'; lots: number; qt: number }> = [
+        { pc: 'MIS', lots: cleanLots, qt: cleanLots * csvLotMult },
       ];
       if (cleanLots > 1) {
-        attemptConfigs.push({ pc: 'MIS', lots: 1 });
+        attemptConfigs.push({ pc: 'MIS', lots: 1, qt: 1 * csvLotMult });
       }
-      attemptConfigs.push({ pc: 'NRML', lots: Math.min(cleanLots, 1) });
+      attemptConfigs.push({ pc: 'NRML', lots: 1, qt: 1 * csvLotMult });
+      if (csvLotMult > 1 && exchSeg !== 'nse_fo') {
+        attemptConfigs.push({ pc: 'MIS', lots: 1, qt: 1 });
+      }
 
-      let brokerOrderId = '';
-      let acceptedPc: 'MIS' | 'NRML' = 'MIS';
-      let acceptedLots = cleanLots;
+      let verifiedFill: {
+        orderId: string;
+        exOrdId: string;
+        fillPrice: number | null;
+        status: string;
+        pc: 'MIS' | 'NRML';
+        lots: number;
+      } | null = null;
       let lastRejectMsg = '';
 
       for (const attempt of attemptConfigs) {
@@ -2875,7 +3200,7 @@ async function startServer() {
                 pf: 'N',
                 pr: '0',
                 pt: 'MKT',
-                qt: String(attempt.lots),
+                qt: String(attempt.qt),
                 rt: 'DAY',
                 tp: '0',
                 ts: kotakTs,
@@ -2890,50 +3215,91 @@ async function startServer() {
             errMsg?: string;
             message?: string;
           };
-          if (orderResp.ok && orderJson.stat !== 'Not_Ok' && orderJson.nOrdNo) {
-            brokerOrderId = orderJson.nOrdNo;
-            acceptedPc = attempt.pc;
-            acceptedLots = attempt.lots;
+          if (!orderResp.ok || orderJson.stat === 'Not_Ok' || !orderJson.nOrdNo) {
+            lastRejectMsg =
+              orderJson.errMsg || orderJson.message || `HTTP ${orderResp.status}`;
+            continue;
+          }
+
+          // NOW VERIFY IN KOTAK /quick/user/orders THAT THIS nOrdNo ACTUALLY EXECUTED ON THE EXCHANGE!
+          const check = await verifyKotakOrderExecution(liveBrokerSession, orderJson.nOrdNo);
+          if (check.verified) {
+            verifiedFill = {
+              orderId: check.orderId,
+              exOrdId: check.exOrdId,
+              fillPrice: check.fillPrice,
+              status: check.status,
+              pc: attempt.pc,
+              lots: attempt.lots,
+            };
             break;
           }
-          lastRejectMsg =
-            orderJson.errMsg || orderJson.message || `HTTP ${orderResp.status}`;
+
+          lastRejectMsg = `Order #${check.orderId} ${check.status}: ${check.reason}`;
+          if (check.fatalNonRetryable) {
+            break;
+          }
         } catch (err) {
           lastRejectMsg = err instanceof Error ? err.message : 'Timeout';
         }
       }
 
-      if (!brokerOrderId) {
+      if (!verifiedFill) {
+        await reconcileWithKotakBrokerBook(liveBrokerSession);
         return {
           ok: false,
           status: 400,
-          error: `Kotak LIVE Order Rejected: ${lastRejectMsg} (Contract: ${kotakTs} · ${exchSeg})`,
+          error: `Kotak Exchange Rejected (${kotakTs} · ${exchSeg}): ${lastRejectMsg}`,
         };
       }
 
-      const entryNum = Number(params.entryPrice) || 0;
-      const slNum = Number(params.stopLoss) || 0;
+      // Sync real post-trade Kotak margin & position book immediately!
+      const [postTradeLimits] = await Promise.all([
+        fetchKotakLiveMarginDetails(liveBrokerSession),
+        reconcileWithKotakBrokerBook(liveBrokerSession),
+      ]);
+      if (postTradeLimits) {
+        acc.balanceInr = postTradeLimits.availableInr;
+        acc.equityInr = Number((postTradeLimits.availableInr + postTradeLimits.usedMarginInr).toFixed(2));
+        acc.usedMarginInr = postTradeLimits.usedMarginInr;
+      }
+
+      const realEntry =
+        verifiedFill.fillPrice && verifiedFill.fillPrice > 0
+          ? Number(verifiedFill.fillPrice.toFixed(spec.decimals))
+          : Number(params.entryPrice) || 0;
+      const origEntry = Number(params.entryPrice) || realEntry;
+      const entryDelta = realEntry - origEntry;
+      const slNum = Number(((Number(params.stopLoss) || 0) + entryDelta).toFixed(spec.decimals));
+      const tpNum = Number(((Number(params.takeProfit) || 0) + entryDelta).toFixed(spec.decimals));
+
+      const verifiedNote = `${params.confluenceNote ? `${params.confluenceNote} · ` : ''}[KOTAK_VERIFIED_FILL #${verifiedFill.exOrdId}]`;
+
       const record: PersistentOracleVault['liveTrades'][number] = {
-        id: String(params.id || `NEO-${Date.now().toString().slice(-6)}`),
-        brokerOrderId,
+        id: String(params.id || `NEO-${verifiedFill.orderId.slice(-6)}`),
+        brokerOrderId: verifiedFill.orderId,
         brokerMode: 'LIVE',
         symbol: cleanSym,
+        trdSymbol: kotakTs,
         direction: cleanDir,
-        lots: acceptedLots,
-        entryPrice: entryNum,
+        lots: verifiedFill.lots,
+        entryPrice: realEntry,
         stopLoss: slNum,
-        takeProfit: Number(params.takeProfit) || 0,
+        takeProfit: tpNum,
         initialStopDistance:
-          params.initialStopDistance ?? Math.max(spec.tickSize * 6, Math.abs(entryNum - slNum)),
+          params.initialStopDistance ?? Math.max(spec.tickSize * 6, Math.abs(realEntry - slNum)),
         breakEvenLocked: false,
         trailingActivated: false,
         targetStepCount: 0,
-        productCode: acceptedPc,
+        productCode: verifiedFill.pc,
+        exchangeVerified: true,
+        kotakOrderStatus: 'COMPLETE',
+        exchangeOrderId: verifiedFill.exOrdId,
         pnlInr: 0,
         pnlTicks: 0,
         status: 'OPEN',
         strategyUsed: String(params.strategyUsed || 'EMA_RSI_CONFLUENCE'),
-        confluenceNote: params.confluenceNote ? String(params.confluenceNote) : undefined,
+        confluenceNote: verifiedNote,
         ts: Date.now(),
       };
 
@@ -2997,90 +3363,121 @@ async function startServer() {
           ? 'nse_fo'
           : 'cde_fo');
       const kotakTs = (
+        existingTrade.trdSymbol ??
         resolved?.trdSymbol ??
-        (existingTrade.symbol === 'NIFTY50'
-          ? 'NIFTY'
-          : existingTrade.symbol === 'BANKNIFTY'
-          ? 'BANKNIFTY'
-          : existingTrade.symbol)
+        existingTrade.symbol
       ).toUpperCase();
       const oppositeSide = existingTrade.direction === 'BUY' ? 'S' : 'B';
       const exitProductCode = existingTrade.productCode ?? 'MIS';
+      const csvLotMult = resolved?.lotSize ?? 1;
+      const exitQty = Math.max(1, Math.round(existingTrade.lots)) * csvLotMult;
 
-      try {
-        const closeResp = await fetch(`${liveBrokerSession.baseUrl}/quick/order/rule/ms/place`, {
-          method: 'POST',
-          headers: {
-            Accept: 'application/json',
-            Auth: liveBrokerSession.tradingToken,
-            Sid: liveBrokerSession.tradingSid,
-            'neo-fin-key': 'neotradeapi',
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: new URLSearchParams({
-            jData: JSON.stringify({
-              am: 'NO',
-              dq: '0',
-              es: exchSeg,
-              mp: '0',
-              pc: exitProductCode,
-              pf: 'N',
-              pr: '0',
-              pt: 'MKT',
-              qt: String(Math.max(1, Math.round(existingTrade.lots))),
-              rt: 'DAY',
-              tp: '0',
-              ts: kotakTs,
-              tt: oppositeSide,
-            }),
-          }).toString(),
-          signal: AbortSignal.timeout(8000),
-        });
-        const closeJson = (await closeResp.json().catch(() => ({}))) as {
-          stat?: string;
-          nOrdNo?: string;
-          errMsg?: string;
-          message?: string;
-        };
-        if (!closeResp.ok || closeJson.stat === 'Not_Ok' || !closeJson.nOrdNo) {
+      // Check first if position was already squared off directly from Kotak Neo Phone App!
+      const posCheck = await fetchRawKotakPositions(liveBrokerSession);
+      const livePosRow = posCheck.ok
+        ? posCheck.rows
+            .map(mapKotakPositionSummary)
+            .find((p) => p.trdSymbol.toUpperCase() === kotakTs && p.netQty !== 0)
+        : undefined;
+
+      let realExitFillPrice = Number(params.exitPrice) || existingTrade.entryPrice;
+
+      if (!posCheck.ok || livePosRow) {
+        try {
+          const closeResp = await fetch(`${liveBrokerSession.baseUrl}/quick/order/rule/ms/place`, {
+            method: 'POST',
+            headers: {
+              Accept: 'application/json',
+              Auth: liveBrokerSession.tradingToken,
+              Sid: liveBrokerSession.tradingSid,
+              'neo-fin-key': 'neotradeapi',
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: new URLSearchParams({
+              jData: JSON.stringify({
+                am: 'NO',
+                dq: '0',
+                es: exchSeg,
+                mp: '0',
+                pc: exitProductCode,
+                pf: 'N',
+                pr: '0',
+                pt: 'MKT',
+                qt: String(livePosRow ? Math.abs(livePosRow.netQty) : exitQty),
+                rt: 'DAY',
+                tp: '0',
+                ts: kotakTs,
+                tt: oppositeSide,
+              }),
+            }).toString(),
+            signal: AbortSignal.timeout(8000),
+          });
+          const closeJson = (await closeResp.json().catch(() => ({}))) as {
+            stat?: string;
+            nOrdNo?: string;
+            errMsg?: string;
+            message?: string;
+          };
+          if (!closeResp.ok || closeJson.stat === 'Not_Ok' || !closeJson.nOrdNo) {
+            return {
+              ok: false,
+              status: 400,
+              error: `Kotak LIVE Exit Rejected: ${
+                closeJson.errMsg || closeJson.message || `HTTP ${closeResp.status}`
+              }`,
+            };
+          }
+
+          const verifyClose = await verifyKotakOrderExecution(liveBrokerSession, closeJson.nOrdNo);
+          if (!verifyClose.verified) {
+            return {
+              ok: false,
+              status: 400,
+              error: `Kotak Exit Order #${verifyClose.orderId} ${verifyClose.status}: ${verifyClose.reason}`,
+            };
+          }
+          if (verifyClose.fillPrice && verifyClose.fillPrice > 0) {
+            realExitFillPrice = Number(verifyClose.fillPrice.toFixed(spec.decimals));
+          }
+        } catch (err) {
           return {
             ok: false,
-            status: 400,
-            error: `Kotak LIVE Exit Order Rejected: ${
-              closeJson.errMsg || closeJson.message || `HTTP ${closeResp.status}`
-            }`,
+            status: 502,
+            error: `Kotak LIVE Exit network error: ${err instanceof Error ? err.message : 'Timeout'}`,
           };
         }
-      } catch (err) {
-        return {
-          ok: false,
-          status: 502,
-          error: `Kotak LIVE Exit network error: ${err instanceof Error ? err.message : 'Timeout'}`,
-        };
       }
 
-      const refreshedMargin = await fetchKotakLiveMarginDetails(liveBrokerSession);
-      const numericPnl = Number(params.pnlInr) || 0;
+      // STRICTLY fetch real Kotak balance from /quick/user/limits — NEVER add fake P&L locally!
+      const [refreshedMargin] = await Promise.all([
+        fetchKotakLiveMarginDetails(liveBrokerSession),
+        reconcileWithKotakBrokerBook(liveBrokerSession),
+      ]);
       if (refreshedMargin !== null) {
         acc.balanceInr = refreshedMargin.availableInr;
         acc.equityInr = Number((refreshedMargin.availableInr + refreshedMargin.usedMarginInr).toFixed(2));
         acc.usedMarginInr = refreshedMargin.usedMarginInr;
-      } else {
-        acc.balanceInr = Number(Math.max(0, acc.balanceInr + numericPnl).toFixed(2));
-        acc.equityInr = acc.balanceInr;
       }
       acc.lastHeartbeat = new Date().toISOString();
 
       // Clear any bar cooldown immediately so the 24x7 bot continues hunting the next trade non-stop!
       lastServerBotBarBucket.delete(existingTrade.symbol);
 
+      const diff =
+        existingTrade.direction === 'BUY'
+          ? realExitFillPrice - existingTrade.entryPrice
+          : existingTrade.entryPrice - realExitFillPrice;
+      const realPnlTicks = Number((diff / spec.tickSize).toFixed(1));
+      const realPnlInr = Number((realPnlTicks * spec.valuePerTickInr * existingTrade.lots).toFixed(2));
+
       vault.liveTrades = vault.liveTrades.map((t) =>
         t.id === params.id
           ? {
               ...t,
-              exitPrice: Number(params.exitPrice) || t.entryPrice,
-              pnlInr: numericPnl,
-              pnlTicks: Number(params.pnlTicks) || 0,
+              exitPrice: realExitFillPrice,
+              pnlInr: realPnlInr,
+              pnlTicks: realPnlTicks,
+              kotakOrderStatus: 'CLOSED_VERIFIED',
               status: params.status || 'CLOSED_MANUAL',
             }
           : t
@@ -3092,13 +3489,13 @@ async function startServer() {
         memIdx >= 0
           ? vault.aiMemory[memIdx].indicatorConfig
           : STRATEGY_CATALOG[0].defaultRawConfig;
-      const evolved = evolveIndicatorConfigFromOutcome(baseCfg, params.status, numericPnl);
+      const evolved = evolveIndicatorConfigFromOutcome(baseCfg, params.status, realPnlInr);
       aiEvolutionNote = evolved.note;
       if (memIdx >= 0) {
         const prev = vault.aiMemory[memIdx];
         const nextTrades = prev.tradesCount + 1;
         const prevWins = Math.round((prev.winRatePct / 100) * prev.tradesCount);
-        const nextWr = Number((((prevWins + (numericPnl > 0 ? 1 : 0)) / nextTrades) * 100).toFixed(1));
+        const nextWr = Number((((prevWins + (realPnlInr > 0 ? 1 : 0)) / nextTrades) * 100).toFixed(1));
         vault.aiMemory[memIdx] = {
           ...prev,
           indicatorConfig: evolved.nextConfig,
