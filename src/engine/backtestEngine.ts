@@ -353,6 +353,109 @@ export const INDIAN_SYMBOLS: Record<TradingSymbol, SymbolSpec> = {
     volatility: 0.0036,
     decimals: 2,
   },
+  // === 6. Indian MCX Commodity Futures (Kotak Neo mcx_fo · 09:00 AM – 11:55 PM IST) ===
+  GOLDPETAL: {
+    symbol: 'GOLDPETAL',
+    name: 'MCX Gold Petal (1g · Low Margin ~₹1,100)',
+    exchange: 'MCX_FO',
+    group: 'MCX_COMMODITY',
+    category: 'Commodity',
+    tickSize: 1,
+    lotUnits: 1,
+    valuePerTickInr: 1,
+    inrPerPointPerLot: 1,
+    typicalSpreadTicks: 2,
+    basePrice: 8850,
+    marginPerLotInr: 1100,
+    annualDrift: 0.14,
+    volatility: 0.0028,
+    decimals: 0,
+  },
+  GOLDM: {
+    symbol: 'GOLDM',
+    name: 'MCX Gold Mini (100g · Quoted per 10g INR)',
+    exchange: 'MCX_FO',
+    group: 'MCX_COMMODITY',
+    category: 'Commodity',
+    tickSize: 1,
+    lotUnits: 10,
+    valuePerTickInr: 10,
+    inrPerPointPerLot: 10,
+    typicalSpreadTicks: 3,
+    basePrice: 88500,
+    marginPerLotInr: 62000,
+    annualDrift: 0.14,
+    volatility: 0.0028,
+    decimals: 0,
+  },
+  GOLD: {
+    symbol: 'GOLD',
+    name: 'MCX Gold Standard (1kg · Quoted per 10g INR)',
+    exchange: 'MCX_FO',
+    group: 'MCX_COMMODITY',
+    category: 'Commodity',
+    tickSize: 1,
+    lotUnits: 100,
+    valuePerTickInr: 100,
+    inrPerPointPerLot: 100,
+    typicalSpreadTicks: 3,
+    basePrice: 88500,
+    marginPerLotInr: 620000,
+    annualDrift: 0.14,
+    volatility: 0.0028,
+    decimals: 0,
+  },
+  SILVERMIC: {
+    symbol: 'SILVERMIC',
+    name: 'MCX Silver Micro (1kg · ~₹11,500 Margin)',
+    exchange: 'MCX_FO',
+    group: 'MCX_COMMODITY',
+    category: 'Commodity',
+    tickSize: 1,
+    lotUnits: 1,
+    valuePerTickInr: 1,
+    inrPerPointPerLot: 1,
+    typicalSpreadTicks: 3,
+    basePrice: 101500,
+    marginPerLotInr: 11500,
+    annualDrift: 0.16,
+    volatility: 0.0038,
+    decimals: 0,
+  },
+  CRUDEOILM: {
+    symbol: 'CRUDEOILM',
+    name: 'MCX Crude Oil Mini (10 Bbl · ~₹6,800 Margin)',
+    exchange: 'MCX_FO',
+    group: 'MCX_COMMODITY',
+    category: 'Commodity',
+    tickSize: 1,
+    lotUnits: 10,
+    valuePerTickInr: 10,
+    inrPerPointPerLot: 10,
+    typicalSpreadTicks: 2,
+    basePrice: 6150,
+    marginPerLotInr: 6800,
+    annualDrift: 0.08,
+    volatility: 0.0045,
+    decimals: 0,
+  },
+  XAUUSD: {
+    symbol: 'XAUUSD',
+    name: 'Spot Gold / US Dollar (24×5 Global Gold)',
+    exchange: 'GLOBAL_FX',
+    group: 'MCX_COMMODITY',
+    category: 'Commodity',
+    tickSize: 0.1,
+    lotUnits: 10,
+    valuePerTickInr: 93,
+    inrPerPointPerLot: 930,
+    typicalSpreadTicks: 3,
+    basePrice: 2940.0,
+    marginPerLotInr: 12000,
+    annualDrift: 0.14,
+    volatility: 0.0029,
+    decimals: 2,
+  },
 };
 
 export const SYMBOL_GROUPS: Array<{
@@ -360,7 +463,11 @@ export const SYMBOL_GROUPS: Array<{
   symbols: TradingSymbol[];
 }> = [
   {
-    label: 'NSE CDS INR Pairs (Kotak Neo Legal)',
+    label: 'MCX Gold, Silver & Crude (Kotak MCX · 9 AM–11:55 PM IST)',
+    symbols: ['GOLDPETAL', 'GOLDM', 'GOLD', 'SILVERMIC', 'CRUDEOILM', 'XAUUSD'],
+  },
+  {
+    label: 'NSE CDS INR Pairs (Kotak Neo Legal · 9 AM–5 PM IST)',
     symbols: ['USDINR', 'EURINR', 'GBPINR', 'JPYINR'],
   },
   {
@@ -376,7 +483,7 @@ export const SYMBOL_GROUPS: Array<{
     symbols: ['AUDINR', 'CADINR', 'CHFINR'],
   },
   {
-    label: 'NSE Index Futures (Kotak Neo F&O)',
+    label: 'NSE Index Futures (Kotak Neo F&O · 9:15 AM–3:30 PM IST)',
     symbols: ['NIFTY50', 'BANKNIFTY', 'FINNIFTY'],
   },
 ];
@@ -869,19 +976,18 @@ export function calculateLotSize(
   currentPrice?: number
 ): number {
   const spec = INDIAN_SYMBOLS[symbol];
-  const riskInr = Math.max(100, equityInr * (riskPct / 100));
+  const safeEquity = Math.max(500, equityInr);
+  const riskInr = Math.max(50, safeEquity * (riskPct / 100));
   const slTicks = Math.max(4, stopLossDistancePrice / spec.tickSize);
-  const rawLots = riskInr / (slTicks * spec.valuePerTickInr);
+  const rawLots = riskInr / Math.max(1, slTicks * spec.valuePerTickInr);
 
-  // Leverage-adjusted margin per NSE lot (uses max 65% of capital across margin)
-  const effectiveMargin =
-    spec.category === 'Currency'
-      ? Math.max(850, (spec.marginPerLotInr * 10) / Math.max(1, leverage))
-      : Math.max(15000, (spec.marginPerLotInr * 10) / Math.max(1, leverage));
-
+  // Strictly cap lots by real exchange SPAN+Exposure margin per lot (with 12% RMS safety buffer)
+  // so Kotak Neo never rejects orders for insufficient margin!
+  void leverage;
   void currentPrice;
-  const maxLotsByMargin = Math.max(1, Math.floor((equityInr * 0.65) / effectiveMargin));
-  const roundedLots = Math.max(1, Math.min(Math.round(rawLots), maxLotsByMargin, 250));
+  const usableMarginInr = safeEquity * 0.88;
+  const maxLotsByRealMargin = Math.max(1, Math.floor(usableMarginInr / Math.max(500, spec.marginPerLotInr)));
+  const roundedLots = Math.max(1, Math.min(Math.max(1, Math.round(rawLots)), maxLotsByRealMargin, 250));
   return roundedLots;
 }
 

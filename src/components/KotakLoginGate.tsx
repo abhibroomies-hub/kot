@@ -15,7 +15,7 @@ import { DeployGuideModal } from './DeployGuideModal';
 interface KotakLoginGateProps {
   lastUcc: string;
   oracleDb?: OracleDbStatusInfo | null;
-  defaultExchangeSegment: 'NSE_CDS' | 'NSE_FO';
+  defaultExchangeSegment: 'NSE_CDS' | 'NSE_FO' | 'MCX_FO';
   defaultBrokerageTier: RiskConfig['brokerageTier'];
   defaultLeverage: RiskConfig['leverage'];
   onLoginSuccess: (payload: {
@@ -24,7 +24,7 @@ interface KotakLoginGateProps {
     consumerKey: string;
     totp: string;
     mpin: string;
-    exchangeSegment: 'NSE_CDS' | 'NSE_FO';
+    exchangeSegment: 'NSE_CDS' | 'NSE_FO' | 'MCX_FO';
     brokerageTier: RiskConfig['brokerageTier'];
     leverage: RiskConfig['leverage'];
   }) => Promise<string | null>;
@@ -43,7 +43,7 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
   const [consumerKey, setConsumerKey] = useState('');
   const [totp, setTotp] = useState('');
   const [mpin, setMpin] = useState('');
-  const [exchangeSegment, setExchangeSegment] = useState<'NSE_CDS' | 'NSE_FO'>(
+  const [exchangeSegment, setExchangeSegment] = useState<'NSE_CDS' | 'NSE_FO' | 'MCX_FO'>(
     defaultExchangeSegment
   );
   const [brokerageTier, setBrokerageTier] =
@@ -251,11 +251,14 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
                 <select
                   id="gate-kotak-segment"
                   value={exchangeSegment}
-                  onChange={(e) => setExchangeSegment(e.target.value as 'NSE_CDS' | 'NSE_FO')}
+                  onChange={(e) =>
+                    setExchangeSegment(e.target.value as 'NSE_CDS' | 'NSE_FO' | 'MCX_FO')
+                  }
                   className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 focus:outline-none rounded-lg px-3 py-2.5 text-xs text-white"
                 >
-                  <option value="NSE_CDS">NSE CDS (7 Legal Pairs: USDINR, EURINR, GBPINR, JPYINR, EURUSD, GBPUSD, USDJPY)</option>
-                  <option value="NSE_FO">NSE F&O (NIFTY50, BANKNIFTY, FINNIFTY)</option>
+                  <option value="NSE_CDS">NSE CDS (7 Legal Pairs: USDINR, EURINR, GBPINR, JPYINR... · 9 AM–5 PM)</option>
+                  <option value="MCX_FO">MCX Commodities (GOLDPETAL, GOLDM, GOLD, SILVERMIC, CRUDEOILM · 9 AM–11:55 PM)</option>
+                  <option value="NSE_FO">NSE F&O (NIFTY50, BANKNIFTY, FINNIFTY · 9:15 AM–3:30 PM)</option>
                 </select>
               </div>
 

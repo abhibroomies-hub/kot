@@ -69,11 +69,13 @@ type ActiveView = 'QUAD_DESK' | 'BACKTEST_FIXER' | 'RISK_MARGIN' | 'KOTAK_ORACLE
 
 const QUAD_FRAMES: QuadTimeframe[] = ['30M', '5M', '1M', '30S'];
 const EXTRA_TAB_CANDIDATES: TradingSymbol[] = [
+  'GOLDPETAL',
+  'GOLDM',
+  'CRUDEOILM',
+  'SILVERMIC',
   'EURUSD',
   'GBPUSD',
   'USDJPY',
-  'GBPJPY',
-  'AUDINR',
   'NIFTY50',
   'BANKNIFTY',
   'USDINR',
@@ -144,6 +146,8 @@ export default function App() {
   // Live Quotes & SSE Stream State
   const [quotesBySymbol, setQuotesBySymbol] = useState<Partial<Record<TradingSymbol, LiveMarketQuote>>>({});
   const [kotakContracts, setKotakContracts] = useState<Record<string, string>>({});
+  const [botDiagnostics, setBotDiagnostics] = useState<Record<string, string>>({});
+  const [refreshingMargin, setRefreshingMargin] = useState<boolean>(false);
   const [quadRefreshNonce, setQuadRefreshNonce] = useState<number>(0);
   const [quadFetchError, setQuadFetchError] = useState<string | null>(null);
   const [chartEngine, setChartEngine] = useState<'TV_QUANT' | 'TRADINGVIEW_DIRECT'>('TV_QUANT');
@@ -274,6 +278,7 @@ export default function App() {
             typeof t.initialStopDistance === 'number' ? t.initialStopDistance : undefined,
           breakEvenLocked: Boolean(t.breakEvenLocked),
           trailingActivated: Boolean(t.trailingActivated),
+          targetStepCount: typeof t.targetStepCount === 'number' ? t.targetStepCount : 0,
           pnlInr,
           pnlTicks,
           openedAt: new Date(Number(t.ts) || Date.now()).toLocaleTimeString(),
@@ -367,6 +372,9 @@ export default function App() {
         if (typeof data.lastBotAction === 'string' && data.lastBotAction) {
           lastServerBotActionRef.current = data.lastBotAction;
         }
+        if (data.botDiagnostics && typeof data.botDiagnostics === 'object') {
+          setBotDiagnostics(data.botDiagnostics);
+        }
         if (data.kotakContracts && typeof data.kotakContracts === 'object') {
           setKotakContracts(data.kotakContracts);
         }
@@ -442,6 +450,12 @@ export default function App() {
             const mapped = mapServerTradesToUi(data.liveTrades);
             liveTradesRef.current = mapped;
             setLiveTrades(mapped);
+          }
+          if (data.botDiagnostics && typeof data.botDiagnostics === 'object') {
+            setBotDiagnostics(data.botDiagnostics);
+          }
+          if (data.kotakContracts && typeof data.kotakContracts === 'object') {
+            setKotakContracts(data.kotakContracts);
           }
           if (
             typeof data.lastBotAction === 'string' &&
@@ -612,8 +626,10 @@ export default function App() {
       const tpDist = Math.max(spec.tickSize * 10, atrBase * cfg.atrMultiplierTP);
       const mode: BrokerMode = 'LIVE';
 
+      const availableForOrder =
+        liveAccount.balanceInr > 0 ? liveAccount.balanceInr : Math.max(5000, equityRef.current);
       const lots = calculateLotSize(
-        Math.max(5000, equityRef.current),
+        availableForOrder,
         riskConfigRef.current.riskPerTradePct,
         slDist,
         sym,
@@ -678,12 +694,21 @@ export default function App() {
           return data;
         })
         .then((resp) => {
-          if (resp?.trade?.brokerOrderId) {
+          if (resp?.trade) {
             const updated = liveTradesRef.current.map((tr) =>
-              tr.id === tradeId ? { ...tr, brokerOrderId: resp.trade.brokerOrderId } : tr
+              tr.id === tradeId
+                ? {
+                    ...tr,
+                    lots: Number(resp.trade.lots) || tr.lots,
+                    brokerOrderId: resp.trade.brokerOrderId ?? tr.brokerOrderId,
+                  }
+                : tr
             );
             liveTradesRef.current = updated;
             setLiveTrades(updated);
+          }
+          if (resp?.account) {
+            setLiveAccount(resp.account);
           }
           syncKotakOrderBook();
         })
@@ -698,7 +723,7 @@ export default function App() {
         `Kotak Neo LIVE ${direction} ${lots} Lots ${sym} @ ${entry.toFixed(spec.decimals)} (${confluenceNote ?? 'Manual'})`
       );
     },
-    [syncKotakOrderBook]
+    [liveAccount.balanceInr, syncKotakOrderBook]
   );
 
   const handleCloseLiveTrade = useCallback(
@@ -1277,7 +1302,7 @@ export default function App() {
     consumerKey: string;
     totp: string;
     mpin: string;
-    exchangeSegment: 'NSE_CDS' | 'NSE_FO';
+    exchangeSegment: 'NSE_CDS' | 'NSE_FO' | 'MCX_FO';
     brokerageTier: RiskConfig['brokerageTier'];
     leverage: RiskConfig['leverage'];
   }): Promise<string | null> => {
@@ -1303,7 +1328,7 @@ export default function App() {
         setActiveView('QUAD_DESK');
         syncKotakOrderBook();
         setStatusNotice(
-          `Kotak Neo LIVE Connected (UCC ${data.account.ucc}) · Auto-Loading Real 4-TF Charts`
+          `Kotak Neo LIVE Connected (UCC ${data.account.ucc}) · Balance ${formatInr(data.account.balanceInr)}`
         );
         setRiskConfig((prev) => ({
           ...prev,
@@ -1320,12 +1345,14 @@ export default function App() {
   };
 
   const handleRefreshKotakLimits = async (): Promise<string | null> => {
+    setRefreshingMargin(true);
     try {
       const resp = await fetch('/api/kotak/refresh-limits', { method: 'POST' });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) return data.error || 'Unable to sync Kotak Neo margin';
       if (data.account) {
         setLiveAccount(data.account);
+        setStatusNotice(`Kotak Real Balance Synced: ${formatInr(data.account.balanceInr)}`);
         if (Number(data.account.balanceInr) > 0) {
           setRiskConfig((prev) => ({
             ...prev,
@@ -1336,6 +1363,8 @@ export default function App() {
       return null;
     } catch {
       return 'Network error while refreshing Kotak margin';
+    } finally {
+      setRefreshingMargin(false);
     }
   };
 
@@ -1561,14 +1590,28 @@ export default function App() {
             ))}
           </select>
 
-          <button
-            type="button"
-            onClick={() => setActiveView('KOTAK_ORACLE')}
-            className="hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-mono font-semibold border bg-emerald-600/20 border-emerald-500/70 text-emerald-300 hover:bg-emerald-600/30 transition-colors whitespace-nowrap shrink-0"
-          >
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-            Kotak LIVE · {liveAccount.ucc}
-          </button>
+          <div className="flex items-center rounded-md border bg-emerald-950/40 border-emerald-500/60 overflow-hidden shrink-0">
+            <button
+              type="button"
+              onClick={() => setActiveView('KOTAK_ORACLE')}
+              title="Open Kotak Account & Real Margin Details"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-mono font-semibold text-emerald-300 hover:bg-emerald-600/20 transition-colors whitespace-nowrap"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+              <span className="hidden sm:inline">{liveAccount.ucc} ·</span>
+              <span className="text-white font-bold">{formatInr(liveAccount.balanceInr)}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleRefreshKotakLimits()}
+              disabled={refreshingMargin}
+              title="Sync Live Kotak Deposited Balance Now"
+              aria-label="Refresh Kotak Balance"
+              className="px-1.5 py-1.5 border-l border-emerald-500/40 text-emerald-300 hover:bg-emerald-600/30 transition-colors"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshingMargin ? 'animate-spin' : ''}`} />
+            </button>
+          </div>
 
           <button
             type="button"
@@ -1835,6 +1878,52 @@ export default function App() {
           {/* =============================================================== */}
           {activeView === 'QUAD_DESK' && (
             <>
+              {/* Live 24x7 AI Bot Status, Margin Check & Dynamic Target Expansion Strip */}
+              <div className="bg-slate-950/90 border border-slate-800 rounded-lg px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2 min-w-0">
+                  <span
+                    className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded font-mono font-semibold text-[11px] border ${
+                      activeTab.autoBotActive
+                        ? 'bg-emerald-500/15 border-emerald-500/50 text-emerald-300'
+                        : 'bg-slate-900 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    <Bot className="w-3.5 h-3.5" />
+                    {activeTab.autoBotActive ? `24×7 AI BOT ARMED (${activeSymbol})` : 'AI BOT STANDBY'}
+                  </span>
+                  <span className="text-slate-300 font-mono text-[11px] truncate">
+                    {botDiagnostics[activeSymbol] ||
+                      (activeTab.autoBotActive
+                        ? `Scanning ${activeSymbol} 4-TF Confluence (${confluence.confidencePct}% / 62% needed) · Auto Target +1/+2 ON`
+                        : `Click "Start 24×7 ${activeSymbol} Bot" — AI auto-sizes lots to ₹${liveAccount.balanceInr.toFixed(0)} & expands new targets on TP hit!`)}
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 shrink-0 text-[11px] font-mono">
+                  <span className="text-slate-400">
+                    1 Lot Margin ({activeSymbol}):{' '}
+                    <strong
+                      className={
+                        liveAccount.balanceInr === 0 || liveAccount.balanceInr >= activeSpec.marginPerLotInr
+                          ? 'text-emerald-300'
+                          : 'text-amber-300'
+                      }
+                    >
+                      {formatInr(activeSpec.marginPerLotInr)}
+                    </strong>
+                  </span>
+                  {activeQuote?.marketStatus !== 'NSE_LIVE' && activeSymbol !== 'GOLDPETAL' && (
+                    <button
+                      type="button"
+                      onClick={() => handleChangeTabSymbol(activeTab.tabId, 'GOLDPETAL')}
+                      className="px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-300 font-semibold transition-colors"
+                    >
+                      Switch to MCX Gold (GOLDPETAL · ₹1,100 Margin · Live till 11:55 PM)
+                    </button>
+                  )}
+                </div>
+              </div>
+
               {quadFetchError && (
                 <div
                   role="alert"
@@ -1866,6 +1955,8 @@ export default function App() {
                 {QUAD_FRAMES.map((tf) => {
                   const slot = activeTab.slots[tf];
                   const rawCandles = currentFrames?.[tf] ?? [];
+                  const activeOpenTrade =
+                    liveTrades.find((tr) => tr.status === 'OPEN' && tr.symbol === activeSymbol) ?? null;
                   return (
                     <QuadChartCell
                       key={`${activeTab.tabId}-${activeSymbol}-${tf}`}
@@ -1873,6 +1964,7 @@ export default function App() {
                       slot={slot}
                       rawCandles={rawCandles}
                       liveQuote={activeQuote}
+                      openTrade={activeOpenTrade}
                       chartEngine={chartEngine}
                       onChangeStrategy={(nextStrat) => {
                         const preset =
@@ -1989,6 +2081,11 @@ export default function App() {
                               </td>
                               <td className="py-1.5 px-2.5 text-right text-slate-400">
                                 {tr.stopLoss.toFixed(sp.decimals)} / {tr.takeProfit.toFixed(sp.decimals)}
+                                {(tr.targetStepCount ?? 0) > 0 && (
+                                  <span className="ml-1 px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-300 text-[10px]">
+                                    TP+{tr.targetStepCount}
+                                  </span>
+                                )}
                               </td>
                               <td
                                 className={`py-1.5 px-2.5 text-right font-semibold ${

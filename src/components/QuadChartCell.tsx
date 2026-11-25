@@ -7,25 +7,28 @@ import {
   LineStyle,
   createChart,
   type IChartApi,
+  type IPriceLine,
   type ISeriesApi,
   type UTCTimestamp,
 } from 'lightweight-charts';
 import {
   Candle,
   IndicatorConfig,
+  LiveBotTrade,
   LiveMarketQuote,
   QuadChartSlotConfig,
   StrategyArchetype,
   TradingSymbol,
 } from '../engine/types';
-import { INDIAN_SYMBOLS, STRATEGY_CATALOG, computeIndicators } from '../engine/backtestEngine';
-import { Sliders, Sparkles, BookmarkCheck } from 'lucide-react';
+import { INDIAN_SYMBOLS, STRATEGY_CATALOG, computeIndicators, formatInr } from '../engine/backtestEngine';
+import { Sliders, Sparkles, BookmarkCheck, Clock } from 'lucide-react';
 
 interface QuadChartCellProps {
   symbol: TradingSymbol;
   slot: QuadChartSlotConfig;
   rawCandles: Candle[];
   liveQuote: LiveMarketQuote | null;
+  openTrade?: LiveBotTrade | null;
   chartEngine?: 'TV_QUANT' | 'TRADINGVIEW_DIRECT';
   onChangeStrategy: (strategy: StrategyArchetype) => void;
   onToggleAutoAdapt: () => void;
@@ -77,6 +80,12 @@ const TV_DIRECT_SYMBOLS: Record<TradingSymbol, string> = {
   NIFTY50: 'NSE:NIFTY',
   BANKNIFTY: 'NSE:BANKNIFTY',
   FINNIFTY: 'NSE:CNXFINANCE',
+  GOLDPETAL: 'MCX:GOLDPETAL1!',
+  GOLDM: 'MCX:GOLDM1!',
+  GOLD: 'MCX:GOLD1!',
+  SILVERMIC: 'MCX:SILVERMIC1!',
+  CRUDEOILM: 'MCX:CRUDEOILM1!',
+  XAUUSD: 'OANDA:XAUUSD',
 };
 
 const TV_DIRECT_INTERVALS: Record<QuadChartSlotConfig['timeframe'], string> = {
@@ -114,6 +123,7 @@ export const QuadChartCell: React.FC<QuadChartCellProps> = React.memo(
     slot,
     rawCandles,
     liveQuote,
+    openTrade = null,
     chartEngine = 'TV_QUANT',
     onChangeStrategy,
     onToggleAutoAdapt,
@@ -127,6 +137,7 @@ export const QuadChartCell: React.FC<QuadChartCellProps> = React.memo(
     const slowEmaSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
     const bbUpperSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
     const bbLowerSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
+    const tradePriceLinesRef = useRef<IPriceLine[]>([]);
 
     const lastConfigKeyRef = useRef<string>('');
     const lastSeriesSeedKeyRef = useRef<string>('');
@@ -135,6 +146,33 @@ export const QuadChartCell: React.FC<QuadChartCellProps> = React.memo(
 
     const [hoverBar, setHoverBar] = useState<Candle | null>(null);
     const [showIndDrawer, setShowIndDrawer] = useState(false);
+    const [nowTickMs, setNowTickMs] = useState<number>(() => Date.now());
+
+    useEffect(() => {
+      const id = setInterval(() => {
+        setNowTickMs(Date.now());
+      }, 1000);
+      return () => clearInterval(id);
+    }, []);
+
+    const candleCountdown = useMemo(() => {
+      const bucketMs =
+        slot.timeframe === '30S'
+          ? 30_000
+          : slot.timeframe === '1M'
+          ? 60_000
+          : slot.timeframe === '5M'
+          ? 5 * 60_000
+          : 30 * 60_000;
+      const remMs = bucketMs - (nowTickMs % bucketMs);
+      const totalSec = Math.max(0, Math.ceil(remMs / 1000));
+      const mm = String(Math.floor(totalSec / 60)).padStart(2, '0');
+      const ss = String(totalSec % 60).padStart(2, '0');
+      return {
+        label: `${mm}:${ss}`,
+        urgent: totalSec <= 5,
+      };
+    }, [slot.timeframe, nowTickMs]);
 
     const spec = INDIAN_SYMBOLS[symbol];
     const configKey = `${slot.indicatorConfig.fastEmaPeriod}-${slot.indicatorConfig.slowEmaPeriod}-${slot.indicatorConfig.rsiPeriod}-${slot.indicatorConfig.bollingerPeriod}-${slot.indicatorConfig.bollingerStdDev}`;
@@ -415,6 +453,75 @@ export const QuadChartCell: React.FC<QuadChartCellProps> = React.memo(
       lastPlottedTimeRef.current = lastItem.sec;
     }, [chartEngine, tvBars, symbol, slot.timeframe, configKey]);
 
+    // Draw Live Position Entry, Trailing SL & Auto-Expanding TP Price Lines directly on candles!
+    useEffect(() => {
+      const cSeries = candleSeriesRef.current;
+      if (!cSeries || chartEngine !== 'TV_QUANT') return;
+
+      for (const line of tradePriceLinesRef.current) {
+        try {
+          cSeries.removePriceLine(line);
+        } catch {
+          // ignore
+        }
+      }
+      tradePriceLinesRef.current = [];
+
+      if (!openTrade || openTrade.status !== 'OPEN' || openTrade.symbol !== symbol) {
+        return;
+      }
+
+      const entryLine = cSeries.createPriceLine({
+        price: openTrade.entryPrice,
+        color: openTrade.direction === 'BUY' ? '#38BDF8' : '#C084FC',
+        lineWidth: 2,
+        lineStyle: LineStyle.Solid,
+        axisLabelVisible: true,
+        title: `${openTrade.direction} ${openTrade.lots}L (${formatInr(openTrade.pnlInr, true)})`,
+      });
+
+      const slLabel = openTrade.trailingActivated
+        ? 'TRAIL SL'
+        : openTrade.breakEvenLocked
+        ? 'BE LOCK SL'
+        : 'STOP LOSS';
+      const slLine = cSeries.createPriceLine({
+        price: openTrade.stopLoss,
+        color: '#F43F5E',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: slLabel,
+      });
+
+      const tpStep = openTrade.targetStepCount ?? 0;
+      const tpLine = cSeries.createPriceLine({
+        price: openTrade.takeProfit,
+        color: '#10B981',
+        lineWidth: 2,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: tpStep > 0 ? `NEW TARGET +${tpStep}` : 'TARGET TP',
+      });
+
+      tradePriceLinesRef.current = [entryLine, slLine, tpLine];
+    }, [
+      chartEngine,
+      symbol,
+      openTrade?.id,
+      openTrade?.status,
+      openTrade?.entryPrice,
+      openTrade?.stopLoss,
+      openTrade?.takeProfit,
+      openTrade?.pnlInr,
+      openTrade?.trailingActivated,
+      openTrade?.breakEvenLocked,
+      openTrade?.targetStepCount,
+      openTrade?.direction,
+      openTrade?.lots,
+      openTrade?.symbol,
+    ]);
+
     const activeBar = hoverBar ?? enrichedCandles[enrichedCandles.length - 1];
     const rsiVal = activeBar?.rsi ?? 50;
 
@@ -446,6 +553,20 @@ export const QuadChartCell: React.FC<QuadChartCellProps> = React.memo(
               className={`px-1.5 py-0.5 rounded border text-[11px] font-mono font-semibold shrink-0 ${signalBadgeCls}`}
             >
               {slot.liveSignal ?? 'WAIT'}
+            </span>
+            <span
+              data-testid={`candle-expiry-${slot.timeframe}`}
+              title={`Current ${slot.timeframe} candle closes in ${candleCountdown.label}`}
+              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[11px] font-mono tabular-nums font-semibold shrink-0 ${
+                liveQuote?.marketStatus === 'NSE_CLOSED'
+                  ? 'bg-slate-900 border-slate-700 text-slate-400'
+                  : candleCountdown.urgent
+                  ? 'bg-amber-500/20 border-amber-400/60 text-amber-300 animate-pulse'
+                  : 'bg-sky-500/10 border-sky-500/35 text-sky-300'
+              }`}
+            >
+              <Clock className="w-3 h-3" />
+              {liveQuote?.marketStatus === 'NSE_CLOSED' ? 'CLOSED' : candleCountdown.label}
             </span>
           </div>
 
@@ -638,6 +759,46 @@ export const QuadChartCell: React.FC<QuadChartCellProps> = React.memo(
 
         {/* Official TradingView Lightweight Charts v5 OR Direct TradingView Widget */}
         <div className="relative w-full h-[230px] sm:h-[255px] lg:h-[270px] bg-[#070B12]">
+          {openTrade && openTrade.status === 'OPEN' && openTrade.symbol === symbol && (
+            <div className="absolute top-2 left-2 z-10 pointer-events-none flex flex-wrap items-center gap-1.5 px-2 py-1 rounded bg-slate-950/90 border border-sky-500/50 text-[10px] font-mono shadow-lg">
+              <span
+                className={
+                  openTrade.direction === 'BUY' ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'
+                }
+              >
+                LIVE {openTrade.direction} {openTrade.lots}L @ {openTrade.entryPrice.toFixed(spec.decimals)}
+              </span>
+              <span className="text-rose-300">
+                SL:{openTrade.stopLoss.toFixed(spec.decimals)}
+                {openTrade.trailingActivated ? '(TRAIL)' : openTrade.breakEvenLocked ? '(BE)' : ''}
+              </span>
+              <span className="text-emerald-300">
+                TP{openTrade.targetStepCount ? `+${openTrade.targetStepCount}` : ''}:
+                {openTrade.takeProfit.toFixed(spec.decimals)}
+              </span>
+              <span
+                className={
+                  openTrade.pnlInr >= 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'
+                }
+              >
+                {formatInr(openTrade.pnlInr, true)}
+              </span>
+            </div>
+          )}
+          <div className="absolute bottom-7 left-2 z-10 pointer-events-none flex items-center gap-1 px-2 py-0.5 rounded bg-slate-950/85 border border-slate-800 text-[10px] font-mono tabular-nums text-slate-300">
+            <span className="text-slate-400">Candle Close:</span>
+            <span
+              className={
+                liveQuote?.marketStatus === 'NSE_CLOSED'
+                  ? 'text-slate-400'
+                  : candleCountdown.urgent
+                  ? 'text-amber-300 font-bold'
+                  : 'text-sky-300 font-semibold'
+              }
+            >
+              {liveQuote?.marketStatus === 'NSE_CLOSED' ? 'MKT CLOSED' : candleCountdown.label}
+            </span>
+          </div>
           {chartEngine === 'TRADINGVIEW_DIRECT' ? (
             <iframe
               title={`${symbol} ${slot.timeframe} TradingView Direct`}

@@ -17,7 +17,13 @@ export type TradingSymbol =
   | 'CHFINR'
   | 'NIFTY50'
   | 'BANKNIFTY'
-  | 'FINNIFTY';
+  | 'FINNIFTY'
+  | 'GOLDPETAL'
+  | 'GOLDM'
+  | 'GOLD'
+  | 'SILVERMIC'
+  | 'CRUDEOILM'
+  | 'XAUUSD';
 
 export type Timeframe = '30S' | '1M' | '5M' | '15M' | '30M' | '1H';
 
@@ -38,6 +44,7 @@ export type MarketPatternRegime =
 export type BrokerMode = 'LIVE';
 
 export type SymbolGroup =
+  | 'MCX_COMMODITY'
   | 'NSE_CDS_INR'
   | 'NSE_CDS_CROSS'
   | 'GLOBAL_FX'
@@ -47,9 +54,9 @@ export type SymbolGroup =
 export interface SymbolSpec {
   symbol: TradingSymbol;
   name: string;
-  exchange: 'NSE_CDS' | 'NSE_FNO' | 'GLOBAL_FX';
+  exchange: 'NSE_CDS' | 'NSE_FNO' | 'MCX_FO' | 'GLOBAL_FX';
   group: SymbolGroup;
-  category: 'Currency' | 'Index';
+  category: 'Currency' | 'Index' | 'Commodity';
   tickSize: number;
   lotUnits: number; // e.g. 1000 USD for USDINR, 75 qty for NIFTY50
   valuePerTickInr: number; // INR P&L per 1 tick on 1 Lot
@@ -225,13 +232,14 @@ export interface KotakAccountProfile {
   label: string;
   mode: BrokerMode;
   brokerName: 'Kotak Securities Neo API v2';
-  exchangeSegment: 'NSE_CDS' | 'NSE_FO';
+  exchangeSegment: 'NSE_CDS' | 'NSE_FO' | 'MCX_FO';
   ucc: string;
   mobile: string;
   consumerKeyMasked: string;
   brokerageTier: 'Kotak Trade Free (₹0 Intraday)' | 'Kotak Trade Free Pro (₹10/order)';
   balanceInr: number;
   equityInr: number;
+  usedMarginInr?: number;
   leverage: 1 | 5 | 10 | 20 | 35;
   connected: boolean;
   sessionState: 'DISCONNECTED' | 'NEO_LIVE_AUTHENTICATED';
@@ -263,6 +271,7 @@ export interface LiveBotTrade {
   initialStopDistance?: number;
   breakEvenLocked?: boolean;
   trailingActivated?: boolean;
+  targetStepCount?: number;
   pnlInr: number;
   pnlTicks: number;
   openedAt: string;

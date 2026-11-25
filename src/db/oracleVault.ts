@@ -31,7 +31,7 @@ export interface StoredLiveTrade {
 
 export interface OracleAccountSyncMeta {
   ucc: string;
-  exchangeSegment: 'NSE_CDS' | 'NSE_FO';
+  exchangeSegment: 'NSE_CDS' | 'NSE_FO' | 'MCX_FO';
   brokerageTier: string;
   balanceInr: number;
   equityInr: number;
@@ -403,7 +403,12 @@ export class OracleVaultClient {
       const accountMeta: OracleAccountSyncMeta | null = accRow
         ? {
             ucc: String(accRow.KOTAK_UCC || ''),
-            exchangeSegment: String(accRow.EXCHANGE_SEGMENT) === 'NSE_FO' ? 'NSE_FO' : 'NSE_CDS',
+            exchangeSegment:
+              String(accRow.EXCHANGE_SEGMENT) === 'NSE_FO'
+                ? 'NSE_FO'
+                : String(accRow.EXCHANGE_SEGMENT) === 'MCX_FO'
+                ? 'MCX_FO'
+                : 'NSE_CDS',
             brokerageTier: String(accRow.BROKERAGE_TIER || 'Kotak Trade Free (₹0 Intraday)'),
             balanceInr: Number(accRow.BALANCE_INR ?? 0),
             equityInr: Number(accRow.EQUITY_INR ?? 0),

@@ -101,6 +101,8 @@ interface PersistentOracleVault {
     initialStopDistance?: number;
     breakEvenLocked?: boolean;
     trailingActivated?: boolean;
+    targetStepCount?: number;
+    productCode?: 'MIS' | 'NRML';
     pnlInr: number;
     pnlTicks: number;
     status: 'OPEN' | 'CLOSED_TP' | 'CLOSED_SL' | 'CLOSED_MANUAL';
@@ -238,7 +240,12 @@ function loadOrInitVault(): PersistentOracleVault {
         const cleanedLive: KotakAccountProfile = {
           ...fresh.accounts.LIVE,
           ucc: prevUcc,
-          exchangeSegment: prevLive?.exchangeSegment === 'NSE_FO' ? 'NSE_FO' : 'NSE_CDS',
+          exchangeSegment:
+            prevLive?.exchangeSegment === 'NSE_FO'
+              ? 'NSE_FO'
+              : prevLive?.exchangeSegment === 'MCX_FO'
+              ? 'MCX_FO'
+              : 'NSE_CDS',
           brokerageTier: prevLive?.brokerageTier || fresh.accounts.LIVE.brokerageTier,
           connected: false,
           sessionState: 'DISCONNECTED',
@@ -393,6 +400,7 @@ async function startServer() {
       displayTicker: string;
       swissquotePair?: [string, string];
       inrDerived?: 'MUL' | 'DIV' | 'INV_100';
+      mcxFormula?: 'GOLD_1G' | 'GOLD_10G' | 'SILVER_1KG' | 'CRUDE_BBL';
       is24x5Global?: boolean;
     }
   > = {
@@ -565,7 +573,107 @@ async function startServer() {
       tickSize: 0.05,
       displayTicker: 'NSE FIN NIFTY',
     },
+    GOLDPETAL: {
+      yahoo: 'GC=F',
+      scale: 1,
+      decimals: 0,
+      tickSize: 1,
+      displayTicker: 'MCX GOLDPETAL (1g Gold)',
+      swissquotePair: ['XAU', 'USD'],
+      mcxFormula: 'GOLD_1G',
+      is24x5Global: true,
+    },
+    GOLDM: {
+      yahoo: 'GC=F',
+      scale: 1,
+      decimals: 0,
+      tickSize: 1,
+      displayTicker: 'MCX GOLDM Mini (100g)',
+      swissquotePair: ['XAU', 'USD'],
+      mcxFormula: 'GOLD_10G',
+      is24x5Global: true,
+    },
+    GOLD: {
+      yahoo: 'GC=F',
+      scale: 1,
+      decimals: 0,
+      tickSize: 1,
+      displayTicker: 'MCX GOLD Futures (1kg)',
+      swissquotePair: ['XAU', 'USD'],
+      mcxFormula: 'GOLD_10G',
+      is24x5Global: true,
+    },
+    SILVERMIC: {
+      yahoo: 'SI=F',
+      scale: 1,
+      decimals: 0,
+      tickSize: 1,
+      displayTicker: 'MCX SILVERMIC (1kg)',
+      swissquotePair: ['XAG', 'USD'],
+      mcxFormula: 'SILVER_1KG',
+      is24x5Global: true,
+    },
+    CRUDEOILM: {
+      yahoo: 'CL=F',
+      scale: 1,
+      decimals: 0,
+      tickSize: 1,
+      displayTicker: 'MCX CRUDEOILM Mini (10bbl)',
+      mcxFormula: 'CRUDE_BBL',
+      is24x5Global: true,
+    },
+    XAUUSD: {
+      yahoo: 'GC=F',
+      scale: 1,
+      decimals: 2,
+      tickSize: 0.1,
+      displayTicker: 'Spot Gold XAU/USD',
+      swissquotePair: ['XAU', 'USD'],
+      is24x5Global: true,
+    },
   };
+
+  function convertMcxPrice(
+    usdPrice: number,
+    formula: 'GOLD_1G' | 'GOLD_10G' | 'SILVER_1KG' | 'CRUDE_BBL',
+    usdInr: number,
+    decimals: number
+  ): number {
+    const TROY_OUNCE_GRAMS = 31.1034768;
+    const INDIA_DUTY_PARITY = 1.06;
+    let inr = usdPrice * usdInr;
+    if (formula === 'GOLD_1G') {
+      inr = (usdPrice / TROY_OUNCE_GRAMS) * 1 * usdInr * INDIA_DUTY_PARITY;
+    } else if (formula === 'GOLD_10G') {
+      inr = (usdPrice / TROY_OUNCE_GRAMS) * 10 * usdInr * INDIA_DUTY_PARITY;
+    } else if (formula === 'SILVER_1KG') {
+      inr = (usdPrice / TROY_OUNCE_GRAMS) * 1000 * usdInr * INDIA_DUTY_PARITY;
+    } else if (formula === 'CRUDE_BBL') {
+      inr = usdPrice * usdInr;
+    }
+    return Number(inr.toFixed(decimals));
+  }
+
+  function convertMcxCandleArray(
+    candles: RealCandle[],
+    formula: 'GOLD_1G' | 'GOLD_10G' | 'SILVER_1KG' | 'CRUDE_BBL',
+    usdInr: number,
+    decimals: number
+  ): RealCandle[] {
+    return candles.map((c) => {
+      const o = convertMcxPrice(c.open, formula, usdInr, decimals);
+      const cl = convertMcxPrice(c.close, formula, usdInr, decimals);
+      const hi = convertMcxPrice(c.high, formula, usdInr, decimals);
+      const lo = convertMcxPrice(c.low, formula, usdInr, decimals);
+      return {
+        ...c,
+        open: o,
+        high: Math.max(hi, o, cl),
+        low: Math.min(lo, o, cl),
+        close: cl,
+      };
+    });
+  }
 
   function formatUtcDate(ms: number): string {
     // Format timestamps in Indian Standard Time (IST = UTC+05:30) to match Kotak Neo & NSE India
@@ -584,6 +692,20 @@ async function startServer() {
     const dow = ist.getUTCDay(); // 0=Sun, 6=Sat
     if (dow === 0 || dow === 6) return false;
     const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+    if (
+      sym === 'GOLDPETAL' ||
+      sym === 'GOLDM' ||
+      sym === 'GOLD' ||
+      sym === 'SILVERMIC' ||
+      sym === 'CRUDEOILM'
+    ) {
+      // MCX Commodities India: 09:00 AM – 11:55 PM IST
+      return mins >= 9 * 60 && mins <= 23 * 60 + 55;
+    }
+    if (sym === 'XAUUSD') {
+      // Global Spot Gold 24x5
+      return true;
+    }
     if (sym === 'NIFTY50' || sym === 'BANKNIFTY' || sym === 'FINNIFTY') {
       // NSE Equity & F&O: 09:15 – 15:30 IST
       return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
@@ -921,6 +1043,12 @@ async function startServer() {
       throw new Error(`Insufficient real candles for ${sym} ${tf}`);
     }
 
+    if (meta.mcxFormula) {
+      const usdInr = await refreshUsdInrBackground();
+      candles = convertMcxCandleArray(candles, meta.mcxFormula, usdInr, meta.decimals);
+      livePrice = candles[candles.length - 1]?.close ?? livePrice;
+    }
+
     const payload = {
       symbol: sym,
       timeframe: tf,
@@ -968,9 +1096,9 @@ async function startServer() {
 
   interface KotakResolvedContract {
     symbol: TradingSymbol;
-    quoteSegment: 'cde_fo' | 'nse_cm' | 'nse_fo';
+    quoteSegment: 'cde_fo' | 'nse_cm' | 'nse_fo' | 'mcx_fo';
     quoteToken: string;
-    orderSegment: 'cde_fo' | 'nse_fo';
+    orderSegment: 'cde_fo' | 'nse_fo' | 'mcx_fo';
     trdSymbol: string;
   }
 
@@ -1082,7 +1210,7 @@ async function startServer() {
 
   function parseKotakMasterCsvForNearestFutures(
     csvText: string,
-    segment: 'cde_fo' | 'nse_fo',
+    segment: 'cde_fo' | 'nse_fo' | 'mcx_fo',
     targets: Array<{ sym: TradingSymbol; prefixes: string[]; instTypes: string[] }>
   ) {
     const lines = csvText.split(/\r?\n/);
@@ -1113,14 +1241,17 @@ async function startServer() {
 
       for (const t of targets) {
         if (idxInst >= 0 && t.instTypes.length > 0 && !t.instTypes.includes(inst)) continue;
-        const matchesName = t.prefixes.some(
-          (p) => name === p || trd.startsWith(p) && trd.endsWith('FUT')
-        );
+        const matchesName = t.prefixes.some((p) => {
+          if (name === p) return true;
+          if (!trd.startsWith(p) || !trd.endsWith('FUT')) return false;
+          // Ensure GOLD prefix does not accidentally match GOLDM or GOLDPETAL
+          const nextChar = trd.charAt(p.length);
+          return /\d/.test(nextChar);
+        });
         if (!matchesName) continue;
 
         let expNum = Number(idxExp >= 0 ? cols[idxExp] : 0);
         if (!Number.isFinite(expNum) || expNum <= 0) expNum = nowSec + 86400 * 30;
-        // Kotak cde_fo / nse_fo expiry is often epoch seconds (or +315513000 offset from 1980)
         if (expNum > 1e12) expNum = Math.floor(expNum / 1000);
         if (expNum < nowSec - 86400) continue;
 
@@ -1132,12 +1263,12 @@ async function startServer() {
     }
 
     for (const [sym, found] of best.entries()) {
-      if (segment === 'cde_fo') {
+      if (segment === 'cde_fo' || segment === 'mcx_fo') {
         kotakContracts.set(sym, {
           symbol: sym,
-          quoteSegment: 'cde_fo',
+          quoteSegment: segment,
           quoteToken: found.pSymbol,
-          orderSegment: 'cde_fo',
+          orderSegment: segment,
           trdSymbol: found.trdSymbol,
         });
       } else {
@@ -1175,6 +1306,7 @@ async function startServer() {
 
       const cdeUrl = paths.find((u) => u.includes('cde_fo.csv'));
       const nfoUrl = paths.find((u) => u.includes('nse_fo.csv'));
+      const mcxUrl = paths.find((u) => u.includes('mcx_fo.csv'));
 
       const tasks: Promise<void>[] = [];
       if (cdeUrl) {
@@ -1206,6 +1338,23 @@ async function startServer() {
                 { sym: 'NIFTY50', prefixes: ['NIFTY'], instTypes: ['FUTIDX'] },
                 { sym: 'BANKNIFTY', prefixes: ['BANKNIFTY'], instTypes: ['FUTIDX'] },
                 { sym: 'FINNIFTY', prefixes: ['FINNIFTY'], instTypes: ['FUTIDX'] },
+              ]);
+            })
+            .catch(() => {})
+        );
+      }
+      if (mcxUrl) {
+        tasks.push(
+          fetch(mcxUrl, { signal: AbortSignal.timeout(10000) })
+            .then((r) => (r.ok ? r.text() : ''))
+            .then((csv) => {
+              if (!csv) return;
+              parseKotakMasterCsvForNearestFutures(csv, 'mcx_fo', [
+                { sym: 'GOLDPETAL', prefixes: ['GOLDPETAL'], instTypes: ['FUTCOM'] },
+                { sym: 'GOLDM', prefixes: ['GOLDM'], instTypes: ['FUTCOM'] },
+                { sym: 'GOLD', prefixes: ['GOLD'], instTypes: ['FUTCOM'] },
+                { sym: 'SILVERMIC', prefixes: ['SILVERMIC'], instTypes: ['FUTCOM'] },
+                { sym: 'CRUDEOILM', prefixes: ['CRUDEOILM'], instTypes: ['FUTCOM'] },
               ]);
             })
             .catch(() => {})
@@ -1327,8 +1476,20 @@ async function startServer() {
         candles1M = y1m.candles.slice(-200);
         source = 'YAHOO_REAL';
         livePrice = y1m.regularMarketPrice ?? candles1M[candles1M.length - 1]?.close ?? livePrice;
+      } else if (meta.mcxFormula) {
+        // MCX Commodities (GOLDPETAL, GOLDM, GOLD, SILVERMIC, CRUDEOILM) derived from live global futures into exact INR MCX units
+        const [y30m, y5m, y1m] = await Promise.all([
+          fetchYahooChart(meta.yahoo, '21d', '30m', 4, 1),
+          fetchYahooChart(meta.yahoo, '5d', '5m', 4, 1),
+          fetchYahooChart(meta.yahoo, '2d', '1m', 4, 1),
+        ]);
+        candles30M = convertMcxCandleArray(y30m.candles.slice(-200), meta.mcxFormula, usdInr, meta.decimals);
+        candles5M = convertMcxCandleArray(y5m.candles.slice(-200), meta.mcxFormula, usdInr, meta.decimals);
+        candles1M = convertMcxCandleArray(y1m.candles.slice(-200), meta.mcxFormula, usdInr, meta.decimals);
+        source = 'YAHOO_REAL';
+        livePrice = candles1M[candles1M.length - 1]?.close ?? livePrice;
       } else {
-        // Global FX Majors/Crosses (USDJPY, AUDUSD, USDCAD, USDCHF, EURGBP, EURJPY, GBPJPY) + NSE Indices
+        // Global FX Majors/Crosses + XAUUSD + NSE Indices
         const [y30m, y5m, y1m] = await Promise.all([
           fetchYahooChart(meta.yahoo, '21d', '30m', meta.decimals, meta.scale),
           fetchYahooChart(meta.yahoo, '5d', '5m', meta.decimals, meta.scale),
@@ -1781,7 +1942,11 @@ async function startServer() {
               .then((q) => {
                 let bid = q.bid;
                 let ask = q.ask;
-                if (meta.inrDerived === 'MUL') {
+                if (meta.mcxFormula) {
+                  bid = convertMcxPrice(q.bid, meta.mcxFormula, usdInr, meta.decimals);
+                  ask = convertMcxPrice(q.ask, meta.mcxFormula, usdInr, meta.decimals);
+                  if (ask <= bid) ask = bid + meta.tickSize;
+                } else if (meta.inrDerived === 'MUL') {
                   bid = q.bid * usdInr;
                   ask = q.ask * usdInr;
                 } else if (meta.inrDerived === 'DIV') {
@@ -1799,7 +1964,11 @@ async function startServer() {
                   ask: fAsk,
                   mid: Number(((fBid + fAsk) / 2).toFixed(meta.decimals)),
                   spreadTicks: Number(Math.max(1, (fAsk - fBid) / meta.tickSize).toFixed(1)),
-                  source: meta.inrDerived ? 'SWISSQUOTE×INR' : 'SWISSQUOTE_BBO',
+                  source: meta.mcxFormula
+                    ? 'MCX_BULLION_LIVE'
+                    : meta.inrDerived
+                    ? 'SWISSQUOTE×INR'
+                    : 'SWISSQUOTE_BBO',
                   latencyMs: q.latencyMs,
                   ts: Date.now(),
                   marketStatus: isNseMarketOpen(sym) ? 'NSE_LIVE' : 'NSE_CLOSED_GLOBAL_LIVE',
@@ -1810,24 +1979,37 @@ async function startServer() {
           continue;
         }
 
-        // NSE Indices (NIFTY50, BANKNIFTY, FINNIFTY)
+        // NSE Indices (NIFTY50, BANKNIFTY, FINNIFTY) + MCX Crude Oil (CRUDEOILM)
         jobs.push(
           (async () => {
             const t0 = Date.now();
-            const y = await fetchYahooChart(meta.yahoo, '1d', '1m', meta.decimals, meta.scale);
-            const mid = Number((y.regularMarketPrice ?? y.candles[y.candles.length - 1]?.close ?? 0).toFixed(meta.decimals));
+            const y = await fetchYahooChart(
+              meta.yahoo,
+              '1d',
+              '1m',
+              meta.mcxFormula ? 4 : meta.decimals,
+              meta.scale
+            );
+            const rawMid = y.regularMarketPrice ?? y.candles[y.candles.length - 1]?.close ?? 0;
+            const mid = meta.mcxFormula
+              ? convertMcxPrice(rawMid, meta.mcxFormula, usdInr, meta.decimals)
+              : Number(rawMid.toFixed(meta.decimals));
             if (mid > 0) {
-              const half = meta.tickSize * 2;
+              const half = meta.tickSize * (meta.mcxFormula ? 1 : 2);
               broadcastTick({
                 symbol: sym,
                 bid: Number((mid - half).toFixed(meta.decimals)),
                 ask: Number((mid + half).toFixed(meta.decimals)),
                 mid,
-                spreadTicks: 4,
-                source: 'NSE_INDEX_LIVE',
+                spreadTicks: meta.mcxFormula ? 2 : 4,
+                source: meta.mcxFormula ? 'MCX_CRUDE_LIVE' : 'NSE_INDEX_LIVE',
                 latencyMs: Math.max(4, Date.now() - t0),
                 ts: Date.now(),
-                marketStatus: isNseMarketOpen(sym) ? 'NSE_LIVE' : 'NSE_CLOSED',
+                marketStatus: isNseMarketOpen(sym)
+                  ? 'NSE_LIVE'
+                  : meta.is24x5Global
+                  ? 'NSE_CLOSED_GLOBAL_LIVE'
+                  : 'NSE_CLOSED',
               });
             }
           })().catch(() => {})
@@ -2028,11 +2210,16 @@ async function startServer() {
   // Kotak Securities Neo API v2 Broker + Oracle Sync Vault Endpoints
   // ---------------------------------------------------------------------------
   let lastServerBotAction: string | null = null;
+  const botDiagnostics = new Map<TradingSymbol, string>();
 
   app.get('/api/kotak/status', (_req, res) => {
     const resolvedContracts: Record<string, string> = {};
     for (const [sym, c] of kotakContracts.entries()) {
       resolvedContracts[sym] = c.trdSymbol;
+    }
+    const diagObj: Record<string, string> = {};
+    for (const [sym, msg] of botDiagnostics.entries()) {
+      diagObj[sym] = msg;
     }
     res.json({
       activeMode: 'LIVE' as BrokerMode,
@@ -2040,6 +2227,7 @@ async function startServer() {
       armedSymbols: vault.armedSymbols,
       botRiskConfig: vault.botRiskConfig,
       lastBotAction: lastServerBotAction,
+      botDiagnostics: diagObj,
       strategyVerified: vault.strategyVerified,
       liveSessionActive: Boolean(liveBrokerSession),
       kotakScripMasterReady,
@@ -2099,6 +2287,7 @@ async function startServer() {
     liveBrokerSession = null;
     kotakScripMasterReady = false;
     quadCache.clear();
+    botDiagnostics.clear();
     vault.activeMode = 'LIVE';
     vault.autoBotRunning = false;
     vault.armedSymbols = [];
@@ -2108,52 +2297,190 @@ async function startServer() {
       sessionState: 'DISCONNECTED',
       balanceInr: 0,
       equityInr: 0,
+      usedMarginInr: 0,
       lastHeartbeat: 'Disconnected by user',
     };
     saveVault(vault);
     res.json({ success: true, activeMode: 'LIVE', accounts: vault.accounts });
   });
 
-  async function fetchKotakLiveMarginInr(session: NonNullable<typeof liveBrokerSession>): Promise<number | null> {
-    try {
-      const limitsResp = await fetch(`${session.baseUrl}/quick/user/limits`, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          Auth: session.tradingToken,
-          Sid: session.tradingSid,
-          'neo-fin-key': 'neotradeapi',
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: new URLSearchParams({
-          jData: JSON.stringify({ seg: 'ALL', exch: 'ALL', prod: 'ALL' }),
-        }).toString(),
-        signal: AbortSignal.timeout(6000),
-      });
-      const limitsData = (await limitsResp.json().catch(() => ({}))) as {
-        Net?: string | number;
-        net?: string | number;
-        Cash?: string | number;
-        cash?: string | number;
-        CollateralValue?: string | number;
-        data?: { Net?: string | number; Cash?: string | number };
-      };
-      const rawNet =
-        limitsData?.Net ??
-        limitsData?.net ??
-        limitsData?.data?.Net ??
-        limitsData?.Cash ??
-        limitsData?.cash ??
-        limitsData?.data?.Cash;
-      const parsedNet = Number(rawNet);
-      if (Number.isFinite(parsedNet) && parsedNet >= 0) {
-        return parsedNet;
-      }
-      return null;
-    } catch {
-      return null;
+  function parseKotakNumber(val: unknown): number | null {
+    if (typeof val === 'number') {
+      return Number.isFinite(val) ? val : null;
     }
+    if (typeof val === 'string') {
+      const cleaned = val.replace(/[,₹\s]/g, '').trim();
+      if (!cleaned) return null;
+      const n = Number(cleaned);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
   }
+
+  function extractMarginFromKotakPayload(payload: unknown): {
+    availableInr: number | null;
+    usedMarginInr: number;
+  } {
+    if (!payload || typeof payload !== 'object') {
+      return { availableInr: null, usedMarginInr: 0 };
+    }
+    const root = payload as Record<string, unknown>;
+    const candidates: Array<Record<string, unknown>> = [root];
+    if (Array.isArray(root.data)) {
+      for (const item of root.data) {
+        if (item && typeof item === 'object') candidates.push(item as Record<string, unknown>);
+      }
+    } else if (root.data && typeof root.data === 'object') {
+      candidates.push(root.data as Record<string, unknown>);
+    }
+
+    let bestAvailable: number | null = null;
+    let bestUsed = 0;
+
+    for (const obj of candidates) {
+      const directAvailableKeys = [
+        'Net',
+        'net',
+        'MarginAvailable',
+        'marginAvailable',
+        'AvailableMargin',
+        'availableMargin',
+        'TotalMargin',
+        'totalMargin',
+      ];
+      for (const k of directAvailableKeys) {
+        const parsed = parseKotakNumber(obj[k]);
+        if (parsed !== null && parsed >= 0) {
+          bestAvailable = bestAvailable === null ? parsed : Math.max(bestAvailable, parsed);
+        }
+      }
+
+      // Sum cash + same-day UPI payin + collateral if Net was 0 or omitted
+      const cash =
+        parseKotakNumber(obj.Cash ?? obj.cash ?? obj.NotionalCash ?? obj.notionalCash ?? obj.OpnBal) ?? 0;
+      const payin =
+        parseKotakNumber(obj.PayInAmt ?? obj.PayinAmt ?? obj.payinAmt ?? obj.AdhocMargin ?? obj.adhocMargin) ?? 0;
+      const collat =
+        parseKotakNumber(obj.CollateralValue ?? obj.Collateral ?? obj.collateralValue) ?? 0;
+      const used =
+        parseKotakNumber(obj.MarginUsed ?? obj.marginUsed ?? obj.UtilizedMargin ?? obj.SpanMargin) ?? 0;
+      if (used > bestUsed) bestUsed = used;
+
+      const reconstructed = Math.max(0, cash + payin + collat - used);
+      if (reconstructed > 0 && (bestAvailable === null || reconstructed > bestAvailable)) {
+        bestAvailable = reconstructed;
+      }
+    }
+
+    return {
+      availableInr: bestAvailable !== null ? Number(bestAvailable.toFixed(2)) : null,
+      usedMarginInr: Number(bestUsed.toFixed(2)),
+    };
+  }
+
+  async function fetchKotakLiveMarginDetails(session: NonNullable<typeof liveBrokerSession>): Promise<{
+    availableInr: number;
+    usedMarginInr: number;
+  } | null> {
+    const headersBase = {
+      Accept: 'application/json',
+      Auth: session.tradingToken,
+      Sid: session.tradingSid,
+      'neo-fin-key': 'neotradeapi',
+    };
+
+    const segAttempts = [
+      { seg: 'ALL', exch: 'ALL', prod: 'ALL' },
+      { seg: 'CASH', exch: 'ALL', prod: 'ALL' },
+      { seg: 'COM', exch: 'ALL', prod: 'ALL' },
+      { seg: 'CUR', exch: 'ALL', prod: 'ALL' },
+    ];
+
+    let bestAvail: number | null = null;
+    let bestUsed = 0;
+
+    for (const jPayload of segAttempts) {
+      try {
+        const resp = await fetch(`${session.baseUrl}/quick/user/limits`, {
+          method: 'POST',
+          headers: {
+            ...headersBase,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: new URLSearchParams({ jData: JSON.stringify(jPayload) }).toString(),
+          signal: AbortSignal.timeout(5500),
+        });
+        const data = await resp.json().catch(() => null);
+        const extracted = extractMarginFromKotakPayload(data);
+        if (extracted.usedMarginInr > bestUsed) bestUsed = extracted.usedMarginInr;
+        if (extracted.availableInr !== null) {
+          bestAvail = bestAvail === null ? extracted.availableInr : Math.max(bestAvail, extracted.availableInr);
+          if (bestAvail > 0) break;
+        }
+      } catch {
+        // continue probing alternate segment
+      }
+    }
+
+    if (bestAvail === null || bestAvail === 0) {
+      try {
+        const getResp = await fetch(`${session.baseUrl}/quick/user/limits`, {
+          method: 'GET',
+          headers: headersBase,
+          signal: AbortSignal.timeout(5000),
+        });
+        const getData = await getResp.json().catch(() => null);
+        const extracted = extractMarginFromKotakPayload(getData);
+        if (extracted.usedMarginInr > bestUsed) bestUsed = extracted.usedMarginInr;
+        if (extracted.availableInr !== null) {
+          bestAvail = bestAvail === null ? extracted.availableInr : Math.max(bestAvail, extracted.availableInr);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (bestAvail === null) return null;
+    return { availableInr: bestAvail, usedMarginInr: bestUsed };
+  }
+
+  // Real-time 15-second background Kotak Balance & Margin Sync so deposits & live MTM stay accurate 24x7
+  let marginPollBusy = false;
+  setInterval(() => {
+    if (
+      marginPollBusy ||
+      !liveBrokerSession ||
+      vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED'
+    ) {
+      return;
+    }
+    marginPollBusy = true;
+    void fetchKotakLiveMarginDetails(liveBrokerSession)
+      .then((res) => {
+        if (!res || !liveBrokerSession) return;
+        const openUnrealized = vault.liveTrades
+          .filter((t) => t.status === 'OPEN')
+          .reduce((s, t) => s + (Number(t.pnlInr) || 0), 0);
+        const nextEquity = Number(Math.max(0, res.availableInr + res.usedMarginInr + openUnrealized).toFixed(2));
+        if (
+          Math.abs(vault.accounts.LIVE.balanceInr - res.availableInr) >= 0.5 ||
+          Math.abs((vault.accounts.LIVE.usedMarginInr ?? 0) - res.usedMarginInr) >= 0.5
+        ) {
+          vault.accounts.LIVE = {
+            ...vault.accounts.LIVE,
+            balanceInr: res.availableInr,
+            equityInr: nextEquity > 0 ? nextEquity : res.availableInr,
+            usedMarginInr: res.usedMarginInr,
+            lastHeartbeat: new Date().toISOString(),
+          };
+          saveVault(vault);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        marginPollBusy = false;
+      });
+  }, 15_000);
 
   app.post('/api/kotak/connect', async (req, res) => {
     const {
@@ -2292,31 +2619,48 @@ async function startServer() {
         connectedAt: Date.now(),
       };
 
-      // Fetch real Kotak margin limits + bootstrap Scrip Master + quotes in parallel for fast auto-load
+      // Fetch real Kotak margin limits + bootstrap Scrip Master (NSE CDS, NSE FO & MCX Gold/Silver/Crude) in parallel
       quadCache.clear();
       const [fetchedMargin] = await Promise.all([
-        fetchKotakLiveMarginInr(liveBrokerSession),
+        fetchKotakLiveMarginDetails(liveBrokerSession),
         Promise.race([
           initializeKotakScripMaster(liveBrokerSession),
-          new Promise<void>((resolve) => setTimeout(resolve, 2500)),
+          new Promise<void>((resolve) => setTimeout(resolve, 2800)),
         ]),
       ]);
-      void pollKotakNeoLiveQuotes(['USDINR', 'EURINR', 'GBPINR', 'JPYINR', 'NIFTY50', 'BANKNIFTY']);
+      void pollKotakNeoLiveQuotes([
+        'USDINR',
+        'EURINR',
+        'GBPINR',
+        'JPYINR',
+        'GOLDPETAL',
+        'GOLDM',
+        'NIFTY50',
+        'BANKNIFTY',
+      ]);
 
-      const liveBalanceInr = fetchedMargin ?? 0;
+      const liveBalanceInr = fetchedMargin?.availableInr ?? 0;
+      const liveUsedMarginInr = fetchedMargin?.usedMarginInr ?? 0;
       const maskedKey = `${cleanKey.slice(0, 4)}••••${cleanKey.slice(-3)}`;
+      const normalizedSeg: KotakAccountProfile['exchangeSegment'] =
+        exchangeSegment === 'NSE_FO'
+          ? 'NSE_FO'
+          : exchangeSegment === 'MCX_FO'
+          ? 'MCX_FO'
+          : 'NSE_CDS';
       const updatedAccount: KotakAccountProfile = {
         id: `kotak-live-${cleanUcc}`,
         label: 'Kotak Neo Live API Account',
         mode: 'LIVE',
         brokerName: 'Kotak Securities Neo API v2',
-        exchangeSegment: exchangeSegment === 'NSE_FO' ? 'NSE_FO' : 'NSE_CDS',
+        exchangeSegment: normalizedSeg,
         ucc: cleanUcc,
         mobile: `${normalizedMobile.slice(0, 6)}••••${normalizedMobile.slice(-2)}`,
         consumerKeyMasked: maskedKey,
         brokerageTier: brokerageTier || 'Kotak Trade Free (₹0 Intraday)',
         balanceInr: liveBalanceInr,
-        equityInr: liveBalanceInr,
+        equityInr: Number((liveBalanceInr + liveUsedMarginInr).toFixed(2)),
+        usedMarginInr: liveUsedMarginInr,
         leverage: validLev,
         connected: true,
         sessionState: 'NEO_LIVE_AUTHENTICATED',
@@ -2355,15 +2699,16 @@ async function startServer() {
       });
       return;
     }
-    const fetchedMargin = await fetchKotakLiveMarginInr(liveBrokerSession);
+    const fetchedMargin = await fetchKotakLiveMarginDetails(liveBrokerSession);
     if (fetchedMargin === null) {
       res.status(502).json({ error: 'Kotak Neo margin limits fetch nahi ho paaye.' });
       return;
     }
     vault.accounts.LIVE = {
       ...vault.accounts.LIVE,
-      balanceInr: fetchedMargin,
-      equityInr: fetchedMargin,
+      balanceInr: fetchedMargin.availableInr,
+      equityInr: Number((fetchedMargin.availableInr + fetchedMargin.usedMarginInr).toFixed(2)),
+      usedMarginInr: fetchedMargin.usedMarginInr,
       lastHeartbeat: new Date().toISOString(),
     };
     saveVault(vault);
@@ -2448,13 +2793,39 @@ async function startServer() {
     orderInFlightBySymbol.add(cleanSym);
 
     try {
+      const spec = INDIAN_SYMBOLS[cleanSym];
       const cleanDir: 'BUY' | 'SELL' = params.direction === 'SELL' ? 'SELL' : 'BUY';
-      const cleanLots = Math.max(1, Math.round(Number(params.lots) || 1));
+
+      // Refresh margin right before order if cached balance is 0 so fresh deposits are recognized immediately
+      if (acc.balanceInr <= 0 && liveBrokerSession) {
+        const freshLimits = await fetchKotakLiveMarginDetails(liveBrokerSession);
+        if (freshLimits && freshLimits.availableInr > 0) {
+          acc.balanceInr = freshLimits.availableInr;
+          acc.equityInr = Number((freshLimits.availableInr + freshLimits.usedMarginInr).toFixed(2));
+          acc.usedMarginInr = freshLimits.usedMarginInr;
+        }
+      }
+
+      // Anti-Rejection Margin Guard: size lots strictly within 88% of available Kotak INR balance
+      let cleanLots = Math.max(1, Math.round(Number(params.lots) || 1));
+      if (acc.balanceInr > 0) {
+        const maxAffordableLots = Math.floor((acc.balanceInr * 0.88) / spec.marginPerLotInr);
+        if (maxAffordableLots < 1 && acc.balanceInr < spec.marginPerLotInr * 0.82) {
+          return {
+            ok: false,
+            status: 400,
+            error: `Margin Guard: Available ₹${acc.balanceInr.toFixed(0)}, jabki ${cleanSym} ke 1 Lot ke liye ~₹${spec.marginPerLotInr} chahiye (Rejection se bachaya gaya). GOLDPETAL (~₹1,100) ya USDINR (~₹2,450) chunein!`,
+          };
+        }
+        cleanLots = Math.max(1, Math.min(cleanLots, Math.max(1, maxAffordableLots)));
+      }
 
       const resolved = kotakContracts.get(cleanSym);
       const exchSeg =
         resolved?.orderSegment ??
-        (cleanSym === 'NIFTY50' || cleanSym === 'BANKNIFTY' || acc.exchangeSegment === 'NSE_FO'
+        (spec.exchange === 'MCX_FO'
+          ? 'mcx_fo'
+          : spec.exchange === 'NSE_FNO' || acc.exchangeSegment === 'NSE_FO'
           ? 'nse_fo'
           : 'cde_fo');
       const defaultContract =
@@ -2466,59 +2837,77 @@ async function startServer() {
           : cleanSym);
       const kotakTs = String(params.tradingSymbolOverride || defaultContract).trim().toUpperCase();
 
+      // Smart Anti-Rejection Attempt Sequence:
+      // 1. Try MIS with calculated margin-safe lots
+      // 2. If rejected & lots > 1, immediately retry MIS with 1 lot
+      // 3. If product MIS is disallowed on contract (common on certain MCX/CDS contracts), retry NRML with 1 lot
+      const attemptConfigs: Array<{ pc: 'MIS' | 'NRML'; lots: number }> = [
+        { pc: 'MIS', lots: cleanLots },
+      ];
+      if (cleanLots > 1) {
+        attemptConfigs.push({ pc: 'MIS', lots: 1 });
+      }
+      attemptConfigs.push({ pc: 'NRML', lots: Math.min(cleanLots, 1) });
+
       let brokerOrderId = '';
-      try {
-        const orderResp = await fetch(`${liveBrokerSession.baseUrl}/quick/order/rule/ms/place`, {
-          method: 'POST',
-          headers: {
-            Accept: 'application/json',
-            Auth: liveBrokerSession.tradingToken,
-            Sid: liveBrokerSession.tradingSid,
-            'neo-fin-key': 'neotradeapi',
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: new URLSearchParams({
-            jData: JSON.stringify({
-              am: 'NO',
-              dq: '0',
-              es: exchSeg,
-              mp: '0',
-              pc: 'MIS',
-              pf: 'N',
-              pr: '0',
-              pt: 'MKT',
-              qt: String(cleanLots),
-              rt: 'DAY',
-              tp: '0',
-              ts: kotakTs,
-              tt: cleanDir === 'BUY' ? 'B' : 'S',
-            }),
-          }).toString(),
-          signal: AbortSignal.timeout(8000),
-        });
-        const orderJson = (await orderResp.json().catch(() => ({}))) as {
-          stat?: string;
-          nOrdNo?: string;
-          errMsg?: string;
-          message?: string;
-        };
-        if (!orderResp.ok || orderJson.stat === 'Not_Ok' || !orderJson.nOrdNo) {
-          return {
-            ok: false,
-            status: 400,
-            error: `Kotak LIVE Order Rejected: ${
-              orderJson.errMsg || orderJson.message || `HTTP ${orderResp.status}`
-            } (Contract: ${kotakTs})`,
+      let acceptedPc: 'MIS' | 'NRML' = 'MIS';
+      let acceptedLots = cleanLots;
+      let lastRejectMsg = '';
+
+      for (const attempt of attemptConfigs) {
+        try {
+          const orderResp = await fetch(`${liveBrokerSession.baseUrl}/quick/order/rule/ms/place`, {
+            method: 'POST',
+            headers: {
+              Accept: 'application/json',
+              Auth: liveBrokerSession.tradingToken,
+              Sid: liveBrokerSession.tradingSid,
+              'neo-fin-key': 'neotradeapi',
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: new URLSearchParams({
+              jData: JSON.stringify({
+                am: 'NO',
+                dq: '0',
+                es: exchSeg,
+                mp: '0',
+                pc: attempt.pc,
+                pf: 'N',
+                pr: '0',
+                pt: 'MKT',
+                qt: String(attempt.lots),
+                rt: 'DAY',
+                tp: '0',
+                ts: kotakTs,
+                tt: cleanDir === 'BUY' ? 'B' : 'S',
+              }),
+            }).toString(),
+            signal: AbortSignal.timeout(8000),
+          });
+          const orderJson = (await orderResp.json().catch(() => ({}))) as {
+            stat?: string;
+            nOrdNo?: string;
+            errMsg?: string;
+            message?: string;
           };
+          if (orderResp.ok && orderJson.stat !== 'Not_Ok' && orderJson.nOrdNo) {
+            brokerOrderId = orderJson.nOrdNo;
+            acceptedPc = attempt.pc;
+            acceptedLots = attempt.lots;
+            break;
+          }
+          lastRejectMsg =
+            orderJson.errMsg || orderJson.message || `HTTP ${orderResp.status}`;
+        } catch (err) {
+          lastRejectMsg = err instanceof Error ? err.message : 'Timeout';
         }
-        brokerOrderId = orderJson.nOrdNo;
-      } catch (err) {
+      }
+
+      if (!brokerOrderId) {
         return {
           ok: false,
-          status: 502,
-          error: `Kotak LIVE Order network error: ${
-            err instanceof Error ? err.message : 'Timeout'
-          }`,
+          status: 400,
+          error: `Kotak LIVE Order Rejected: ${lastRejectMsg} (Contract: ${kotakTs} · ${exchSeg})`,
         };
       }
 
@@ -2530,14 +2919,16 @@ async function startServer() {
         brokerMode: 'LIVE',
         symbol: cleanSym,
         direction: cleanDir,
-        lots: cleanLots,
+        lots: acceptedLots,
         entryPrice: entryNum,
         stopLoss: slNum,
         takeProfit: Number(params.takeProfit) || 0,
         initialStopDistance:
-          params.initialStopDistance ?? Math.max(INDIAN_SYMBOLS[cleanSym].tickSize * 6, Math.abs(entryNum - slNum)),
+          params.initialStopDistance ?? Math.max(spec.tickSize * 6, Math.abs(entryNum - slNum)),
         breakEvenLocked: false,
         trailingActivated: false,
+        targetStepCount: 0,
+        productCode: acceptedPc,
         pnlInr: 0,
         pnlTicks: 0,
         status: 'OPEN',
@@ -2596,12 +2987,13 @@ async function startServer() {
 
     closeInFlightByTradeId.add(params.id);
     try {
+      const spec = INDIAN_SYMBOLS[existingTrade.symbol];
       const resolved = kotakContracts.get(existingTrade.symbol);
       const exchSeg =
         resolved?.orderSegment ??
-        (existingTrade.symbol === 'NIFTY50' ||
-        existingTrade.symbol === 'BANKNIFTY' ||
-        acc.exchangeSegment === 'NSE_FO'
+        (spec?.exchange === 'MCX_FO'
+          ? 'mcx_fo'
+          : spec?.exchange === 'NSE_FNO' || acc.exchangeSegment === 'NSE_FO'
           ? 'nse_fo'
           : 'cde_fo');
       const kotakTs = (
@@ -2613,6 +3005,7 @@ async function startServer() {
           : existingTrade.symbol)
       ).toUpperCase();
       const oppositeSide = existingTrade.direction === 'BUY' ? 'S' : 'B';
+      const exitProductCode = existingTrade.productCode ?? 'MIS';
 
       try {
         const closeResp = await fetch(`${liveBrokerSession.baseUrl}/quick/order/rule/ms/place`, {
@@ -2630,7 +3023,7 @@ async function startServer() {
               dq: '0',
               es: exchSeg,
               mp: '0',
-              pc: 'MIS',
+              pc: exitProductCode,
               pf: 'N',
               pr: '0',
               pt: 'MKT',
@@ -2666,16 +3059,20 @@ async function startServer() {
         };
       }
 
-      const refreshedMargin = await fetchKotakLiveMarginInr(liveBrokerSession);
+      const refreshedMargin = await fetchKotakLiveMarginDetails(liveBrokerSession);
       const numericPnl = Number(params.pnlInr) || 0;
       if (refreshedMargin !== null) {
-        acc.balanceInr = refreshedMargin;
-        acc.equityInr = refreshedMargin;
+        acc.balanceInr = refreshedMargin.availableInr;
+        acc.equityInr = Number((refreshedMargin.availableInr + refreshedMargin.usedMarginInr).toFixed(2));
+        acc.usedMarginInr = refreshedMargin.usedMarginInr;
       } else {
         acc.balanceInr = Number(Math.max(0, acc.balanceInr + numericPnl).toFixed(2));
         acc.equityInr = acc.balanceInr;
       }
       acc.lastHeartbeat = new Date().toISOString();
+
+      // Clear any bar cooldown immediately so the 24x7 bot continues hunting the next trade non-stop!
+      lastServerBotBarBucket.delete(existingTrade.symbol);
 
       vault.liveTrades = vault.liveTrades.map((t) =>
         t.id === params.id
@@ -2725,7 +3122,7 @@ async function startServer() {
     }
   }
 
-  // 24x7 Autonomous Server Bot Tick Engine (Break-Even + Trailing SL + TP/SL Exit + 4-TF Confluence Entry)
+  // 24x7 Autonomous Server Bot Tick Engine (Dynamic Target Expansion + Trailing SL + Margin-Safe Non-Stop Entry)
   autonomousTickHook = (quote: StreamQuote) => {
     if (!liveBrokerSession || vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED') {
       return;
@@ -2734,8 +3131,8 @@ async function startServer() {
     const spec = INDIAN_SYMBOLS[sym];
     if (!spec) return;
 
-    // 1. Monitor ALL open trades on this symbol for Break-Even, Trailing SL & Auto TP/SL Exit 24x7
-    let slRatcheted = false;
+    // 1. Monitor ALL open trades on this symbol for Dynamic Target Expansion (+1, +2...), Trailing SL & Exit 24x7
+    let tradeMutated = false;
     for (const tr of vault.liveTrades) {
       if (tr.status !== 'OPEN' || tr.symbol !== sym || closeInFlightByTradeId.has(tr.id)) continue;
 
@@ -2751,17 +3148,59 @@ async function startServer() {
       const initDist =
         tr.initialStopDistance ?? Math.max(spec.tickSize * 6, Math.abs(tr.entryPrice - tr.stopLoss));
 
+      // DYNAMIC TARGET EXPANSION: When price hits/nears Target (>= 90% of current TP distance),
+      // lock profit right behind current price AND create a higher NEW TARGET (+1, +2, ...) automatically!
+      const currentTpDist = Math.abs(tr.takeProfit - tr.entryPrice);
+      const reachedTargetZone =
+        initDist > 0 &&
+        currentTpDist > 0 &&
+        ((tr.direction === 'BUY' && markPrice >= tr.takeProfit - initDist * 0.12) ||
+          (tr.direction === 'SELL' && markPrice <= tr.takeProfit + initDist * 0.12));
+
+      if (reachedTargetZone) {
+        const nextStep = (tr.targetStepCount ?? 0) + 1;
+        const lockedSl = Number(
+          (tr.direction === 'BUY'
+            ? markPrice - initDist * 0.45
+            : markPrice + initDist * 0.45
+          ).toFixed(spec.decimals)
+        );
+        const expandedTp = Number(
+          (tr.direction === 'BUY'
+            ? markPrice + initDist * 1.05
+            : markPrice - initDist * 1.05
+          ).toFixed(spec.decimals)
+        );
+
+        if (
+          (tr.direction === 'BUY' && lockedSl > nextSl) ||
+          (tr.direction === 'SELL' && lockedSl < nextSl)
+        ) {
+          nextSl = lockedSl;
+          tr.stopLoss = lockedSl;
+        }
+        tr.takeProfit = expandedTp;
+        tr.targetStepCount = nextStep;
+        tr.breakEvenLocked = true;
+        tr.trailingActivated = true;
+        tradeMutated = true;
+        const msg = `Target Hit -> Auto-Created NEW TARGET +${nextStep} (${expandedTp.toFixed(spec.decimals)}) on ${sym} · Profit Locked @ ${nextSl.toFixed(spec.decimals)}!`;
+        lastServerBotAction = msg;
+        botDiagnostics.set(sym, msg);
+        continue;
+      }
+
       if (vault.botRiskConfig.trailingStopEnabled && initDist > 0) {
-        if (diff >= initDist * Math.max(1.1, vault.botRiskConfig.breakEvenTriggerR)) {
+        if (diff >= initDist * Math.max(1.0, vault.botRiskConfig.breakEvenTriggerR)) {
           const beLevel =
             tr.direction === 'BUY'
-              ? tr.entryPrice + initDist * 0.15
-              : tr.entryPrice - initDist * 0.15;
+              ? tr.entryPrice + initDist * 0.18
+              : tr.entryPrice - initDist * 0.18;
           const trailLevel =
-            diff >= initDist * 1.5
+            diff >= initDist * 1.4
               ? tr.direction === 'BUY'
-                ? markPrice - initDist * 1.1
-                : markPrice + initDist * 1.1
+                ? markPrice - initDist * 0.85
+                : markPrice + initDist * 0.85
               : beLevel;
           const cand =
             tr.direction === 'BUY' ? Math.max(beLevel, trailLevel) : Math.min(beLevel, trailLevel);
@@ -2772,58 +3211,73 @@ async function startServer() {
             nextSl = Number(cand.toFixed(spec.decimals));
             tr.stopLoss = nextSl;
             tr.breakEvenLocked = true;
-            tr.trailingActivated = diff >= initDist * 1.5;
-            slRatcheted = true;
+            tr.trailingActivated = diff >= initDist * 1.4;
+            tradeMutated = true;
           }
         }
       }
 
-      if (
-        (tr.direction === 'BUY' && markPrice >= tr.takeProfit) ||
-        (tr.direction === 'SELL' && markPrice <= tr.takeProfit)
-      ) {
-        void closeKotakLiveOrderInternal({
-          id: tr.id,
-          exitPrice: markPrice,
-          pnlInr,
-          pnlTicks,
-          status: 'CLOSED_TP',
-        }).then((res) => {
-          if (res.ok) {
-            lastServerBotAction = `24×7 Server Bot TP Hit: Closed ${sym} (${pnlInr >= 0 ? '+' : ''}₹${pnlInr})`;
-          }
-        });
-        continue;
-      }
+      botDiagnostics.set(
+        sym,
+        `LIVE ${tr.direction} ${tr.lots}L Open (${pnlInr >= 0 ? '+' : ''}₹${pnlInr}) · SL ${nextSl.toFixed(spec.decimals)} · ${
+          (tr.targetStepCount ?? 0) > 0 ? `NEW TARGET +${tr.targetStepCount}` : 'TP'
+        } ${tr.takeProfit.toFixed(spec.decimals)}`
+      );
 
       if (
         (tr.direction === 'BUY' && markPrice <= nextSl) ||
         (tr.direction === 'SELL' && markPrice >= nextSl)
       ) {
+        const isBankedTargetExit = pnlInr > 0 && ((tr.targetStepCount ?? 0) > 0 || tr.trailingActivated);
+        const exitStatus = isBankedTargetExit ? 'CLOSED_TP' : 'CLOSED_SL';
         void closeKotakLiveOrderInternal({
           id: tr.id,
           exitPrice: markPrice,
           pnlInr,
           pnlTicks,
-          status: 'CLOSED_SL',
+          status: exitStatus,
         }).then((res) => {
           if (res.ok) {
-            lastServerBotAction = `24×7 Server Bot SL Exit: Closed ${sym} (${pnlInr >= 0 ? '+' : ''}₹${pnlInr})`;
+            const note = isBankedTargetExit
+              ? `Target +${tr.targetStepCount ?? 1} Profit Banked on ${sym} (+₹${pnlInr}) · Scanning Next Trade Non-Stop!`
+              : `24×7 Bot SL Exit on ${sym} (${pnlInr >= 0 ? '+' : ''}₹${pnlInr}) · Scanning Next Setup...`;
+            lastServerBotAction = note;
+            botDiagnostics.set(sym, note);
           }
         });
       }
     }
 
-    if (slRatcheted) {
+    if (tradeMutated) {
       saveVault(vault);
     }
 
     // 2. Check 4-Timeframe Confluence Auto-Entry if this symbol is Armed on the Server
-    if (
-      !vault.armedSymbols.includes(sym) ||
-      quote.marketStatus === 'NSE_CLOSED' ||
-      orderInFlightBySymbol.has(sym)
-    ) {
+    if (!vault.armedSymbols.includes(sym)) {
+      return;
+    }
+
+    if (!isNseMarketOpen(sym)) {
+      botDiagnostics.set(
+        sym,
+        spec.exchange === 'MCX_FO'
+          ? `MCX Closed (Opens Mon–Fri 9:00 AM – 11:55 PM IST)`
+          : spec.exchange === 'NSE_FNO'
+          ? `NSE F&O Closed (9:15 AM – 3:30 PM IST) · Gold/Commodities (GOLDPETAL/GOLDM) 11:55 PM tak LIVE hai!`
+          : `NSE Currency Closed (9:00 AM – 5:00 PM IST) · Abhi trade ke liye MCX Gold (GOLDPETAL/GOLDM) chunein (11:55 PM tak LIVE)!`
+      );
+      return;
+    }
+
+    if (spec.exchange === 'GLOBAL_FX' && !kotakContracts.has(sym)) {
+      botDiagnostics.set(
+        sym,
+        `${sym} Global Spot Reference hai — Kotak Real Order ke liye GOLDPETAL, GOLDM, USDINR, EURINR ya NIFTY50 chunein`
+      );
+      return;
+    }
+
+    if (orderInFlightBySymbol.has(sym)) {
       return;
     }
 
@@ -2835,14 +3289,25 @@ async function startServer() {
     if (now - lastEval < 2500) return;
     lastServerBotEvalTs.set(sym, now);
 
-    // Daily Drawdown Circuit Breaker check
+    // Daily Drawdown Circuit Breaker check (NEVER stops on profit — only protects against max daily loss!)
     const startOfDayTs = new Date().setHours(0, 0, 0, 0);
     const todayPnlInr = vault.liveTrades
       .filter((t) => t.ts >= startOfDayTs)
       .reduce((sum, t) => sum + (Number(t.pnlInr) || 0), 0);
-    const refCap = Math.max(5000, vault.accounts.LIVE.equityInr || vault.accounts.LIVE.balanceInr || 25000);
+    const liveAvail = vault.accounts.LIVE.balanceInr;
+    const refCap = liveAvail > 0 ? liveAvail : Math.max(5000, vault.accounts.LIVE.equityInr || 10000);
     if (todayPnlInr <= -refCap * (vault.botRiskConfig.maxDailyDrawdownPct / 100)) {
-      lastServerBotAction = `Daily Loss Guard Active (${vault.botRiskConfig.maxDailyDrawdownPct}% limit reached)`;
+      const msg = `Daily Max Loss Guard Active (${vault.botRiskConfig.maxDailyDrawdownPct}% limit)`;
+      lastServerBotAction = msg;
+      botDiagnostics.set(sym, msg);
+      return;
+    }
+
+    if (liveAvail > 0 && liveAvail < spec.marginPerLotInr * 0.82) {
+      botDiagnostics.set(
+        sym,
+        `Balance ₹${liveAvail.toFixed(0)} hai (${sym} 1 Lot margin ~₹${spec.marginPerLotInr}). Rejection se bachne ke liye GOLDPETAL (~₹1,100) ya USDINR (~₹2,450) lagayein!`
+      );
       return;
     }
 
@@ -2889,6 +3354,10 @@ async function startServer() {
 
         const confluence = evaluateMultiTimeframeConfluence(slots);
         if (confluence.direction === 'WAIT' || confluence.confidencePct < 62) {
+          botDiagnostics.set(
+            sym,
+            `AI Scanning 4-TF Live (${slots['1M'].patternLabel}) · Confluence ${confluence.confidencePct}% (62%+ hote hi Auto-Order jayega)`
+          );
           return;
         }
 
@@ -2901,8 +3370,9 @@ async function startServer() {
         const slDist = Math.max(spec.tickSize * 6, atrBase * cfg.atrMultiplierSL);
         const tpDist = Math.max(spec.tickSize * 10, atrBase * cfg.atrMultiplierTP);
 
+        const sizingCapital = vault.accounts.LIVE.balanceInr > 0 ? vault.accounts.LIVE.balanceInr : refCap;
         const lots = calculateLotSize(
-          refCap,
+          sizingCapital,
           vault.botRiskConfig.riskPerTradePct,
           slDist,
           sym,
@@ -2929,9 +3399,12 @@ async function startServer() {
         });
 
         if (execRes.ok) {
-          lastServerBotAction = `24×7 Bot ${confluence.direction} ${lots}L ${sym} @ ${entry.toFixed(spec.decimals)}`;
+          const msg = `24×7 Bot Placed ${confluence.direction} ${execRes.trade.lots}L ${sym} @ ${entry.toFixed(spec.decimals)} (SL ${stopLoss.toFixed(spec.decimals)} · TP ${takeProfit.toFixed(spec.decimals)})`;
+          lastServerBotAction = msg;
+          botDiagnostics.set(sym, msg);
         } else {
           lastServerBotAction = execRes.error;
+          botDiagnostics.set(sym, execRes.error);
         }
       } catch {
         // Retry cleanly on subsequent tick
