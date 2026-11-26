@@ -2426,15 +2426,16 @@ async function startServer() {
   const lastServerBotEvalTs = new Map<TradingSymbol, number>();
   const lastServerBotBarBucket = new Map<TradingSymbol, number>();
   let sessionExpiredReason: string | null = null;
+  let totpRefreshRequired = false;
   let autoReloginPromise: Promise<boolean> | null = null;
 
   // Kept STRICTLY in volatile Node process RAM (never persisted to disk JSON or exposed to client)
-  let inMemoryKotakAutoCreds: {
+  let inMemoryKotakAuthBase: {
     ucc: string;
     mobile: string;
     consumerKey: string;
     mpin: string;
-    totpSecret: string;
+    totpSecret?: string;
     exchangeSegment: KotakAccountProfile['exchangeSegment'];
     brokerageTier: KotakAccountProfile['brokerageTier'];
     leverage: 1 | 5 | 10 | 20 | 35;
@@ -2494,7 +2495,11 @@ async function startServer() {
       const parsed = new URL(String(rawUrl || '').trim());
       if (parsed.protocol !== 'https:') return null;
       const host = parsed.hostname.toLowerCase();
-      if (host !== 'kotaksecurities.com' && !host.endsWith('.kotaksecurities.com')) {
+      const allowedSuffixes = ['kotaksecurities.com', 'kotakneo.com', 'kotak.com'];
+      const isAllowedHost = allowedSuffixes.some(
+        (domain) => host === domain || host.endsWith(`.${domain}`)
+      );
+      if (!isAllowedHost) {
         return null;
       }
       return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '');
@@ -2503,46 +2508,44 @@ async function startServer() {
     }
   }
 
-  function isKotakJwtExpired(token: string, safetyBufferMs = 45_000): boolean {
-    try {
-      const parts = String(token || '').split('.');
-      if (parts.length < 2) return false;
-      const jsonStr = Buffer.from(parts[1], 'base64url').toString('utf-8');
-      const payload = JSON.parse(jsonStr) as { exp?: number };
-      if (typeof payload.exp === 'number' && payload.exp > 0) {
-        return payload.exp * 1000 <= Date.now() + safetyBufferMs;
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
-
-  function isKotakSessionExpiredError(httpStatus: number, payloadOrMsg: unknown): boolean {
-    if (httpStatus === 401 || httpStatus === 403) return true;
-    const rawText =
-      typeof payloadOrMsg === 'string'
-        ? payloadOrMsg
-        : payloadOrMsg && typeof payloadOrMsg === 'object'
-        ? JSON.stringify(payloadOrMsg)
+  function isKotakSessionExpiredError(payloadOrMsg: unknown): boolean {
+    if (!payloadOrMsg) return false;
+    let candidate = '';
+    if (typeof payloadOrMsg === 'string') {
+      candidate = payloadOrMsg;
+    } else if (typeof payloadOrMsg === 'object') {
+      const obj = payloadOrMsg as Record<string, unknown>;
+      const errArrMsg = Array.isArray(obj.error)
+        ? String((obj.error[0] as Record<string, unknown> | undefined)?.message || '')
+        : typeof obj.error === 'object' && obj.error !== null
+        ? String((obj.error as Record<string, unknown>).message || '')
+        : typeof obj.error === 'string'
+        ? obj.error
         : '';
-    const lower = rawText.toLowerCase();
+      candidate = [obj.errMsg, obj.emsg, obj.message, errArrMsg]
+        .filter((v): v is string => typeof v === 'string' && v.length > 0)
+        .join(' ');
+    }
+    const lower = candidate.toLowerCase();
+    if (!lower) return false;
     return (
-      lower.includes('invalid session') ||
-      lower.includes('invalid token') ||
-      lower.includes('invalid jwt') ||
+      lower.includes('invalid session token') ||
+      lower.includes('session token expired') ||
       lower.includes('session expired') ||
-      lower.includes('token expired') ||
+      lower.includes('invalid jwt') ||
       lower.includes('jwt expired') ||
-      lower.includes('session not found') ||
-      lower.includes('unauthorized') ||
-      lower.includes('not logged in')
+      lower.includes('token is expired')
     );
   }
 
-  function getEffectiveAutoCreds(): NonNullable<typeof inMemoryKotakAutoCreds> | null {
-    if (inMemoryKotakAutoCreds && inMemoryKotakAutoCreds.totpSecret) {
-      return inMemoryKotakAutoCreds;
+  function getEffectiveAutoCreds():
+    | (NonNullable<typeof inMemoryKotakAuthBase> & { totpSecret: string })
+    | null {
+    if (inMemoryKotakAuthBase?.totpSecret) {
+      return {
+        ...inMemoryKotakAuthBase,
+        totpSecret: inMemoryKotakAuthBase.totpSecret,
+      };
     }
     const envUcc = String(process.env.KOTAK_UCC || '').trim().toUpperCase();
     const envMobile = String(process.env.KOTAK_MOBILE || '').trim();
@@ -2589,6 +2592,8 @@ async function startServer() {
       botDiagnostics: diagObj,
       strategyVerified: vault.strategyVerified,
       liveSessionActive: Boolean(liveBrokerSession),
+      totpRefreshRequired,
+      canQuickRefreshTotp: Boolean(inMemoryKotakAuthBase),
       sessionExpiredReason,
       autoReloginConfigured: Boolean(getEffectiveAutoCreds()),
       kotakScripMasterReady,
@@ -2651,7 +2656,8 @@ async function startServer() {
 
   app.post('/api/kotak/disconnect', (_req, res) => {
     liveBrokerSession = null;
-    inMemoryKotakAutoCreds = null;
+    inMemoryKotakAuthBase = null;
+    totpRefreshRequired = false;
     sessionExpiredReason = null;
     kotakScripMasterReady = false;
     kotakContracts.clear();
@@ -2771,9 +2777,8 @@ async function startServer() {
 
     const segAttempts = [
       { seg: 'ALL', exch: 'ALL', prod: 'ALL' },
-      { seg: 'CASH', exch: 'ALL', prod: 'ALL' },
-      { seg: 'COM', exch: 'ALL', prod: 'ALL' },
       { seg: 'CUR', exch: 'ALL', prod: 'ALL' },
+      { seg: 'CASH', exch: 'ALL', prod: 'ALL' },
     ];
 
     let bestAvail: number | null = null;
@@ -2792,7 +2797,7 @@ async function startServer() {
           signal: AbortSignal.timeout(5500),
         });
         const data = await resp.json().catch(() => null);
-        if (isKotakSessionExpiredError(resp.status, data)) {
+        if (isKotakSessionExpiredError(data)) {
           sawExpiredToken = true;
           break;
         }
@@ -2815,33 +2820,6 @@ async function startServer() {
         }
       }
       return null;
-    }
-
-    if (bestAvail === null || bestAvail === 0) {
-      try {
-        const getResp = await fetch(`${session.baseUrl}/quick/user/limits`, {
-          method: 'GET',
-          headers: headersBase,
-          signal: AbortSignal.timeout(5000),
-        });
-        const getData = await getResp.json().catch(() => null);
-        if (isKotakSessionExpiredError(getResp.status, getData)) {
-          if (allowReloginRetry) {
-            const renewed = await handleKotakSessionInvalidated('Kotak GET limits: invalid session token');
-            if (renewed && liveBrokerSession) {
-              return fetchKotakLiveMarginDetails(liveBrokerSession, false);
-            }
-          }
-          return null;
-        }
-        const extracted = extractMarginFromKotakPayload(getData);
-        if (extracted.usedMarginInr > bestUsed) bestUsed = extracted.usedMarginInr;
-        if (extracted.availableInr !== null) {
-          bestAvail = bestAvail === null ? extracted.availableInr : Math.max(bestAvail, extracted.availableInr);
-        }
-      } catch {
-        // ignore
-      }
     }
 
     if (bestAvail === null) return null;
@@ -2897,8 +2875,8 @@ async function startServer() {
         `Kotak TOTP Login failed (HTTP ${step1Resp.status})`;
       return {
         ok: false,
-        status: 401,
-        error: `Kotak Neo Step-1 (TOTP) Reject: ${kotakMsg}. Check karein ki API Access Token, UCC, Mobile (+91...), aur Authenticator TOTP sahi hai.`,
+        status: 400,
+        error: `Kotak Neo Step-1 (TOTP) Reject: ${kotakMsg}. Check karein ki fresh 6-digit Authenticator TOTP sahi hai.`,
       };
     }
 
@@ -2935,7 +2913,7 @@ async function startServer() {
         `Kotak MPIN Validate failed (HTTP ${step2Resp.status})`;
       return {
         ok: false,
-        status: 401,
+        status: 400,
         error: `Kotak Neo Step-2 (MPIN) Reject: ${kotakMsg}. Apna 6-digit MPIN verify karein.`,
       };
     }
@@ -2948,6 +2926,7 @@ async function startServer() {
       baseUrl: validatedBaseUrl,
       connectedAt: Date.now(),
     };
+    totpRefreshRequired = false;
     sessionExpiredReason = null;
 
     quadCache.clear();
@@ -3015,7 +2994,7 @@ async function startServer() {
     return { ok: true, account: updatedAccount };
   }
 
-  async function handleKotakSessionInvalidated(reason: string): Promise<boolean> {
+  async function handleKotakSessionInvalidated(_reason: string): Promise<boolean> {
     if (autoReloginPromise) {
       return autoReloginPromise;
     }
@@ -3036,7 +3015,9 @@ async function startServer() {
               leverage: autoCreds.leverage,
             });
             if (reloginRes.ok) {
-              const okMsg = `24×7 Auto-Login: Kotak daily session token auto-renewed (UCC ${autoCreds.ucc}) · Trading Active!`;
+              totpRefreshRequired = false;
+              sessionExpiredReason = null;
+              const okMsg = `24×7 Auto-Login: Kotak session token auto-renewed (UCC ${autoCreds.ucc}) · Trading Active!`;
               lastServerBotAction = okMsg;
               for (const s of vault.armedSymbols) {
                 botDiagnostics.set(s, okMsg);
@@ -3046,34 +3027,20 @@ async function startServer() {
           }
         }
 
-        // No auto-TOTP secret configured (or auto-login rejected) -> immediately flip to DISCONNECTED so user sees Login Gate!
-        liveBrokerSession = null;
-        const expMsg =
-          'Kotak Daily Session Token raat ko expire ho gaya tha (Kotak roz subah naya token mangta hai) — naye 6-digit TOTP se Re-Login karein, ya 24×7 Auto-TOTP Secret daalein!';
-        sessionExpiredReason = `${expMsg} [${reason}]`;
-        lastServerBotAction = expMsg;
+        // ZERO FORCED LOGOUT: Keep the user inside the 4-Chart Desk and turn on the inline 1-box 6-Digit TOTP Quick Refresh bar!
+        totpRefreshRequired = true;
+        const refreshMsg =
+          'Kotak API Token Refresh chahiye (Phone me Kotak Neo App kholne ya naye din par Kotak token rotate kar deta hai) — upar 6-digit TOTP daal kar 2 sec me refresh karein!';
+        sessionExpiredReason = refreshMsg;
+        lastServerBotAction = refreshMsg;
         for (const s of vault.armedSymbols) {
-          botDiagnostics.set(s, expMsg);
+          botDiagnostics.set(s, refreshMsg);
         }
-        vault.accounts.LIVE = {
-          ...vault.accounts.LIVE,
-          connected: false,
-          sessionState: 'DISCONNECTED',
-          lastHeartbeat: 'SESSION EXPIRED — Fresh 6-digit TOTP required',
-        };
-        saveVault(vault);
         return false;
       } catch {
-        liveBrokerSession = null;
+        totpRefreshRequired = true;
         sessionExpiredReason =
-          'Kotak Daily Session Token expire ho gaya hai — naye 6-digit TOTP se Re-Login karein!';
-        vault.accounts.LIVE = {
-          ...vault.accounts.LIVE,
-          connected: false,
-          sessionState: 'DISCONNECTED',
-          lastHeartbeat: 'SESSION EXPIRED — Fresh 6-digit TOTP required',
-        };
-        saveVault(vault);
+          'Kotak API Token Refresh chahiye — upar 6-digit TOTP box me code daal kar 2 sec me refresh karein!';
         return false;
       } finally {
         autoReloginPromise = null;
@@ -3083,18 +3050,7 @@ async function startServer() {
     return autoReloginPromise;
   }
 
-  // Proactive 30-second Kotak JWT Expiry Watchdog + Optional Boot/.env Auto-Connect
-  setInterval(() => {
-    if (liveBrokerSession && vault.accounts.LIVE.sessionState === 'NEO_LIVE_AUTHENTICATED') {
-      const ageHours = (Date.now() - liveBrokerSession.connectedAt) / 3_600_000;
-      if (isKotakJwtExpired(liveBrokerSession.tradingToken, 90_000) || ageHours >= 20) {
-        void handleKotakSessionInvalidated('Proactive daily token expiry check');
-      }
-    } else if (!liveBrokerSession && getEffectiveAutoCreds()) {
-      void handleKotakSessionInvalidated('24×7 Auto-Connect from configured TOTP secret');
-    }
-  }, 30_000);
-
+  // Optional 24x7 Boot/.env Auto-Connect ONLY when TOTP Secret is explicitly configured (never disconnects active users)
   if (!liveBrokerSession && getEffectiveAutoCreds()) {
     setTimeout(() => {
       if (!liveBrokerSession && getEffectiveAutoCreds()) {
@@ -3103,11 +3059,12 @@ async function startServer() {
     }, 2500);
   }
 
-  // Real-time 15-second background Kotak Balance & Margin Sync so deposits & live MTM stay accurate 24x7
+  // Real-time 15-second background Kotak Balance & Margin Sync (paused cleanly while waiting for TOTP refresh)
   let marginPollBusy = false;
   setInterval(() => {
     if (
       marginPollBusy ||
+      totpRefreshRequired ||
       !liveBrokerSession ||
       vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED'
     ) {
@@ -3228,18 +3185,22 @@ async function startServer() {
         return;
       }
 
-      if (cleanTotpSecret.length >= 8 && generateTotpFromBase32Secret(cleanTotpSecret)) {
-        inMemoryKotakAutoCreds = {
-          ucc: cleanUcc,
-          mobile: cleanMobile,
-          consumerKey: cleanKey,
-          mpin: cleanMpin,
-          totpSecret: cleanTotpSecret,
-          exchangeSegment: normalizedSeg,
-          brokerageTier: brokerageTier || 'Kotak Trade Free (₹0 Intraday)',
-          leverage: validLev,
-        };
-      }
+      const validSecret =
+        cleanTotpSecret.length >= 8 && generateTotpFromBase32Secret(cleanTotpSecret)
+          ? cleanTotpSecret
+          : undefined;
+
+      // Keep base auth fields strictly in volatile server RAM so inline 1-box 6-digit TOTP refresh works in 2 seconds!
+      inMemoryKotakAuthBase = {
+        ucc: cleanUcc,
+        mobile: cleanMobile,
+        consumerKey: cleanKey,
+        mpin: cleanMpin,
+        totpSecret: validSecret,
+        exchangeSegment: normalizedSeg,
+        brokerageTier: brokerageTier || 'Kotak Trade Free (₹0 Intraday)',
+        leverage: validLev,
+      };
 
       const resolvedContracts: Record<string, string> = {};
       for (const [sym, c] of kotakContracts.entries()) {
@@ -3264,24 +3225,90 @@ async function startServer() {
     }
   });
 
+  // Seamless 1-Field 6-Digit TOTP Quick Refresh (keeps user on 4-Chart Desk without re-entering UCC/Mobile/Key/MPIN)
+  app.post('/api/kotak/quick-totp', async (req, res) => {
+    const cleanTotp = String(req.body?.totp || '').replace(/\D/g, '').trim();
+    if (!/^\d{6}$/.test(cleanTotp)) {
+      res.status(400).json({
+        error: 'Google/Microsoft Authenticator se fresh 6-digit TOTP code daalein.',
+      });
+      return;
+    }
+    if (!inMemoryKotakAuthBase) {
+      res.status(400).json({
+        error:
+          'Server restart hone ke kaaran base login RAM me nahi hai — upar Logout daba kar ek baar full login karein.',
+      });
+      return;
+    }
+
+    try {
+      const loginResult = await performKotakLoginFlow({
+        ucc: inMemoryKotakAuthBase.ucc,
+        mobile: inMemoryKotakAuthBase.mobile,
+        consumerKey: inMemoryKotakAuthBase.consumerKey,
+        totp: cleanTotp,
+        mpin: inMemoryKotakAuthBase.mpin,
+        exchangeSegment: inMemoryKotakAuthBase.exchangeSegment,
+        brokerageTier: inMemoryKotakAuthBase.brokerageTier,
+        leverage: inMemoryKotakAuthBase.leverage,
+      });
+
+      if (!loginResult.ok) {
+        res.status(400).json({ error: loginResult.error });
+        return;
+      }
+
+      totpRefreshRequired = false;
+      sessionExpiredReason = null;
+      const okMsg = `Kotak API Token Refreshed (UCC ${loginResult.account.ucc}) · Live Orders & 24×7 AI Bot Active!`;
+      lastServerBotAction = okMsg;
+      for (const s of vault.armedSymbols) {
+        botDiagnostics.set(s, okMsg);
+      }
+
+      const resolvedContracts: Record<string, string> = {};
+      for (const [sym, c] of kotakContracts.entries()) {
+        resolvedContracts[sym] = `${c.trdSymbol} (Lot:${c.lotSize})`;
+      }
+
+      res.json({
+        success: true,
+        account: loginResult.account,
+        accounts: vault.accounts,
+        kotakContracts: resolvedContracts,
+        brokerOrders: latestBrokerOrders,
+        brokerPositions: latestBrokerPositions,
+      });
+    } catch (err) {
+      res.status(502).json({
+        error: `Kotak Quick-TOTP Refresh network error: ${
+          err instanceof Error ? err.message : 'Timeout'
+        }`,
+      });
+    }
+  });
+
   app.post('/api/kotak/refresh-limits', async (_req, res) => {
     if (!liveBrokerSession || vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED') {
-      res.status(401).json({
-        error: 'Kotak Neo LIVE session active nahi hai. Pehle Kotak account login karein.',
+      res.status(409).json({
+        totpRefreshRequired: true,
+        error: 'Kotak API Token refresh chahiye — upar 6-digit TOTP daal kar 2 sec me refresh karein.',
       });
       return;
     }
     const fetchedMargin = await fetchKotakLiveMarginDetails(liveBrokerSession);
     if (fetchedMargin === null) {
-      if (!liveBrokerSession) {
-        res.status(401).json({
+      if (totpRefreshRequired) {
+        res.status(409).json({
+          totpRefreshRequired: true,
           error:
             sessionExpiredReason ||
-            'Kotak Daily Session Token expire ho gaya hai — naye 6-digit TOTP se Re-Login karein!',
+            'Kotak API Token refresh chahiye — upar 6-digit TOTP box me code daal kar 2 sec me refresh karein!',
         });
         return;
       }
-      res.status(502).json({ error: 'Kotak Neo margin limits fetch nahi ho paaye.' });
+      res.status(502).json({ error: 'Kotak Neo margin limits abhi busy hain — thodi der me retry karein.' });
       return;
     }
     vault.accounts.LIVE = {
@@ -3314,8 +3341,8 @@ async function startServer() {
       errMsg?: string;
       message?: string;
     };
-    if (isKotakSessionExpiredError(resp.status, data)) {
-      void handleKotakSessionInvalidated(data?.errMsg || data?.message || `orders HTTP ${resp.status}`);
+    if (isKotakSessionExpiredError(data)) {
+      void handleKotakSessionInvalidated(data?.errMsg || data?.message || 'orders invalid session token');
       return [];
     }
     if (!resp.ok) return [];
@@ -3342,8 +3369,8 @@ async function startServer() {
         errMsg?: string;
         message?: string;
       };
-      if (isKotakSessionExpiredError(resp.status, data)) {
-        void handleKotakSessionInvalidated(data?.errMsg || data?.message || `positions HTTP ${resp.status}`);
+      if (isKotakSessionExpiredError(data)) {
+        void handleKotakSessionInvalidated(data?.errMsg || data?.message || 'positions invalid session token');
         return { ok: false, rows: [] };
       }
       if (!resp.ok) return { ok: false, rows: [] };
@@ -3464,7 +3491,9 @@ async function startServer() {
 
   // Reconcile against real Kotak Phone App Positions & Order Book every 10s while connected
   setInterval(() => {
-    if (!liveBrokerSession || vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED') return;
+    if (totpRefreshRequired || !liveBrokerSession || vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED') {
+      return;
+    }
     void reconcileWithKotakBrokerBook(liveBrokerSession);
   }, 10_000);
 
@@ -3621,21 +3650,14 @@ async function startServer() {
     | { ok: true; trade: PersistentOracleVault['liveTrades'][number]; account: KotakAccountProfile }
     | { ok: false; status: number; error: string }
   > {
-    if (
-      liveBrokerSession &&
-      isKotakJwtExpired(liveBrokerSession.tradingToken, 20_000)
-    ) {
-      await handleKotakSessionInvalidated('Kotak JWT expired prior to order');
-    }
-
     const acc = vault.accounts.LIVE;
     if (!liveBrokerSession || acc.sessionState !== 'NEO_LIVE_AUTHENTICATED') {
       return {
         ok: false,
-        status: 401,
+        status: 409,
         error:
           sessionExpiredReason ||
-          'Kotak Neo LIVE session active nahi hai. Real order ke liye naye 6-digit TOTP se Kotak login karein.',
+          'Kotak API Token refresh chahiye — upar 6-digit TOTP box me code daal kar 2 sec me refresh karein.',
       };
     }
 
@@ -3781,7 +3803,7 @@ async function startServer() {
           if (!orderResp.ok || orderJson.stat === 'Not_Ok' || !orderJson.nOrdNo) {
             lastRejectMsg =
               orderJson.errMsg || orderJson.message || `HTTP ${orderResp.status}`;
-            if (isKotakSessionExpiredError(orderResp.status, orderJson)) {
+            if (isKotakSessionExpiredError(orderJson)) {
               if (!sessionRenewedOnce) {
                 sessionRenewedOnce = true;
                 const renewed = await handleKotakSessionInvalidated(lastRejectMsg);
@@ -3836,10 +3858,10 @@ async function startServer() {
       if (sessionExpiredFatal || !liveBrokerSession) {
         return {
           ok: false,
-          status: 401,
+          status: 409,
           error:
             sessionExpiredReason ||
-            'Kotak Daily Session Token expire ho gaya hai (Kotak roz subah naya login mangta hai) — abhi naye 6-digit TOTP se Re-Login karein!',
+            'Kotak API Token Refresh chahiye (Phone me Kotak Neo App kholne ya naye din par Kotak token rotate kar deta hai) — upar 6-digit TOTP box me code daal kar 2 sec me refresh karein!',
         };
       }
 
@@ -3932,8 +3954,10 @@ async function startServer() {
     if (!liveBrokerSession || acc.sessionState !== 'NEO_LIVE_AUTHENTICATED') {
       return {
         ok: false,
-        status: 401,
-        error: 'Kotak Neo LIVE session active nahi hai. Real position exit ke liye login zaroori hai.',
+        status: 409,
+        error:
+          sessionExpiredReason ||
+          'Kotak API Token refresh chahiye — upar 6-digit TOTP box me code daal kar Square-Off karein.',
       };
     }
 
@@ -4024,7 +4048,7 @@ async function startServer() {
           let { closeResp, closeJson } = await placeSquareOff(liveBrokerSession);
           if (
             (!closeResp.ok || closeJson.stat === 'Not_Ok' || !closeJson.nOrdNo) &&
-            isKotakSessionExpiredError(closeResp.status, closeJson)
+            isKotakSessionExpiredError(closeJson)
           ) {
             const renewed = await handleKotakSessionInvalidated(
               closeJson.errMsg || closeJson.message || 'Close order invalid session token'
@@ -4032,10 +4056,10 @@ async function startServer() {
             if (!renewed || !liveBrokerSession) {
               return {
                 ok: false,
-                status: 401,
+                status: 409,
                 error:
                   sessionExpiredReason ||
-                  'Kotak Daily Session Token expire ho gaya hai — Square-off ke liye naye 6-digit TOTP se Re-Login karein!',
+                  'Kotak API Token Refresh chahiye — upar 6-digit TOTP box me code daal kar Square-Off karein!',
               };
             }
             ({ closeResp, closeJson } = await placeSquareOff(liveBrokerSession));
@@ -4144,7 +4168,11 @@ async function startServer() {
 
   // 24x7 Autonomous Server Bot Tick Engine (Dynamic Target Expansion + Trailing SL + Margin-Safe Non-Stop Entry)
   autonomousTickHook = (quote: StreamQuote) => {
-    if (!liveBrokerSession || vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED') {
+    if (
+      totpRefreshRequired ||
+      !liveBrokerSession ||
+      vault.accounts.LIVE.sessionState !== 'NEO_LIVE_AUTHENTICATED'
+    ) {
       return;
     }
     const sym = quote.symbol;
@@ -4449,7 +4477,7 @@ async function startServer() {
           lastServerBotAction = msg;
           botDiagnostics.set(sym, msg);
         } else {
-          if (execRes.status === 401) {
+          if (execRes.status === 409) {
             lastServerBotBarBucket.delete(sym);
           }
           lastServerBotAction = execRes.error;
@@ -4476,7 +4504,11 @@ async function startServer() {
       tradingSymbolOverride: req.body?.tradingSymbolOverride,
     });
     if (!result.ok) {
-      res.status(result.status).json({ error: result.error });
+      res.status(result.status).json({
+        error: result.error,
+        totpRefreshRequired: totpRefreshRequired || result.status === 409,
+        canQuickRefreshTotp: Boolean(inMemoryKotakAuthBase),
+      });
       return;
     }
     res.json({ success: true, trade: result.trade, account: result.account });
@@ -4491,7 +4523,11 @@ async function startServer() {
       status: (req.body?.status as 'CLOSED_TP' | 'CLOSED_SL' | 'CLOSED_MANUAL') || 'CLOSED_MANUAL',
     });
     if (!result.ok) {
-      res.status(result.status).json({ error: result.error });
+      res.status(result.status).json({
+        error: result.error,
+        totpRefreshRequired: totpRefreshRequired || result.status === 409,
+        canQuickRefreshTotp: Boolean(inMemoryKotakAuthBase),
+      });
       return;
     }
     res.json({

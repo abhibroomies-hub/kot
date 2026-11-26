@@ -118,6 +118,10 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState<boolean>(false);
   const [lastUcc, setLastUcc] = useState<string>('');
   const [sessionExpiredReason, setSessionExpiredReason] = useState<string | null>(null);
+  const [totpRefreshRequired, setTotpRefreshRequired] = useState<boolean>(false);
+  const [canQuickRefreshTotp, setCanQuickRefreshTotp] = useState<boolean>(false);
+  const [quickTotpCode, setQuickTotpCode] = useState<string>('');
+  const [quickTotpSubmitting, setQuickTotpSubmitting] = useState<boolean>(false);
   const [liveAccount, setLiveAccount] = useState<KotakAccountProfile>({
     id: 'kotak-live-unlinked',
     label: 'Kotak Neo Live API Account',
@@ -342,6 +346,8 @@ export default function App() {
         } else {
           setSessionExpiredReason(null);
         }
+        setTotpRefreshRequired(Boolean(data.totpRefreshRequired));
+        setCanQuickRefreshTotp(Boolean(data.canQuickRefreshTotp));
         if (data.accounts?.LIVE) {
           setLiveAccount(data.accounts.LIVE);
           if (
@@ -498,7 +504,9 @@ export default function App() {
           } else if (data.sessionExpiredReason === null) {
             setSessionExpiredReason(null);
           }
-          if (data.accounts?.LIVE) {
+          setTotpRefreshRequired(Boolean(data.totpRefreshRequired));
+          setCanQuickRefreshTotp(Boolean(data.canQuickRefreshTotp));
+          if (data.accounts?.LIVE && data.accounts.LIVE.connected) {
             setLiveAccount(data.accounts.LIVE);
           }
           if (Array.isArray(data.aiMemory)) {
@@ -734,16 +742,21 @@ export default function App() {
       })
         .then(async (r) => {
           const data = await r.json().catch(() => ({}));
-          if (r.status === 401) {
+          const lowerErr = String(data?.error || '').toLowerCase();
+          if (
+            data?.totpRefreshRequired ||
+            r.status === 409 ||
+            lowerErr.includes('invalid session') ||
+            lowerErr.includes('token refresh')
+          ) {
+            setTotpRefreshRequired(true);
+            if (typeof data?.canQuickRefreshTotp === 'boolean') {
+              setCanQuickRefreshTotp(data.canQuickRefreshTotp);
+            }
             setSessionExpiredReason(
               data?.error ||
-                'Kotak Daily Session Token expire ho gaya hai — naye 6-digit TOTP se Re-Login karein!'
+                'Kotak API Token Refresh chahiye — upar 6-digit TOTP box me code daal kar 2 sec me refresh karein!'
             );
-            setLiveAccount((prev) => ({
-              ...prev,
-              connected: false,
-              sessionState: 'DISCONNECTED',
-            }));
           }
           if (!r.ok || !data?.trade?.exchangeVerified) {
             throw new Error(
@@ -830,6 +843,12 @@ export default function App() {
       })
         .then(async (r) => {
           const data = await r.json().catch(() => ({}));
+          if (data?.totpRefreshRequired || r.status === 409) {
+            setTotpRefreshRequired(true);
+            if (typeof data?.canQuickRefreshTotp === 'boolean') {
+              setCanQuickRefreshTotp(data.canQuickRefreshTotp);
+            }
+          }
           if (!r.ok) {
             throw new Error(data?.error || 'Kotak Square-Off order fail hua');
           }
@@ -1458,6 +1477,9 @@ export default function App() {
       if (!resp.ok) return data.error || 'Could not connect Kotak Neo account';
       if (data.account) {
         setSessionExpiredReason(null);
+        setTotpRefreshRequired(false);
+        setCanQuickRefreshTotp(true);
+        setQuickTotpCode('');
         setLastUcc(data.account.ucc || payload.ucc);
         setLiveAccount(data.account);
         if (data.kotakContracts && typeof data.kotakContracts === 'object') {
@@ -1495,24 +1517,79 @@ export default function App() {
     return null;
   };
 
+  const handleQuickTotpRefresh = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const code = quickTotpCode.replace(/\D/g, '').trim();
+    if (code.length !== 6 || quickTotpSubmitting) return;
+    setQuickTotpSubmitting(true);
+    try {
+      const resp = await fetch('/api/kotak/quick-totp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ totp: code }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const msg = data?.error || '6-digit TOTP verify nahi hua — naya Authenticator code daalein.';
+        setStatusNotice(msg);
+        setBrokerExecAlert({
+          ok: false,
+          text: msg,
+          time: new Date().toLocaleTimeString(),
+        });
+        return;
+      }
+      setTotpRefreshRequired(false);
+      setSessionExpiredReason(null);
+      setQuickTotpCode('');
+      if (data?.account) {
+        setLiveAccount(data.account);
+      }
+      if (data?.kotakContracts && typeof data.kotakContracts === 'object') {
+        setKotakContracts(data.kotakContracts);
+      }
+      if (Array.isArray(data?.brokerOrders)) {
+        setBrokerOrders(data.brokerOrders);
+        setKotakOrderBookCount(data.brokerOrders.length);
+      }
+      if (Array.isArray(data?.brokerPositions)) {
+        setBrokerPositions(data.brokerPositions);
+      }
+      const okText = `Kotak API Token Refreshed (UCC ${data?.account?.ucc ?? liveAccount.ucc}) · Live Trading & 24×7 AI Bot Active!`;
+      setStatusNotice(okText);
+      setBrokerExecAlert({
+        ok: true,
+        text: okText,
+        time: new Date().toLocaleTimeString(),
+      });
+      syncKotakOrderBook();
+    } catch {
+      setBrokerExecAlert({
+        ok: false,
+        text: 'Network error contacting Kotak Quick-TOTP bridge',
+        time: new Date().toLocaleTimeString(),
+      });
+    } finally {
+      setQuickTotpSubmitting(false);
+    }
+  };
+
   const handleRefreshKotakLimits = async (): Promise<string | null> => {
     setRefreshingMargin(true);
     try {
       const resp = await fetch('/api/kotak/refresh-limits', { method: 'POST' });
       const data = await resp.json().catch(() => ({}));
-      if (resp.status === 401) {
+      if (data?.totpRefreshRequired || resp.status === 409) {
+        setTotpRefreshRequired(true);
         setSessionExpiredReason(
           data?.error ||
-            'Kotak Daily Session Token expire ho gaya hai — naye 6-digit TOTP se Re-Login karein!'
+            'Kotak API Token Refresh chahiye — upar 6-digit TOTP box me code daal kar 2 sec me refresh karein!'
         );
-        setLiveAccount((prev) => ({
-          ...prev,
-          connected: false,
-          sessionState: 'DISCONNECTED',
-        }));
       }
       if (!resp.ok) return data.error || 'Unable to sync Kotak Neo margin';
       if (data.account) {
+        setTotpRefreshRequired(false);
+        setSessionExpiredReason(null);
         setLiveAccount(data.account);
         setStatusNotice(`Kotak Real Balance Synced: ${formatInr(data.account.balanceInr)}`);
         if (Number(data.account.balanceInr) > 0) {
@@ -1575,6 +1652,9 @@ export default function App() {
       setBrokerOrders([]);
       setBrokerPositions([]);
       setBrokerExecAlert(null);
+      setTotpRefreshRequired(false);
+      setCanQuickRefreshTotp(false);
+      setSessionExpiredReason(null);
       setKotakOrderBookCount(0);
       setActiveView('QUAD_DESK');
     } catch {
@@ -2044,6 +2124,62 @@ export default function App() {
               </div>
             </div>
           </div>
+
+          {/* Inline 1-Box 6-Digit TOTP Quick Refresh Bar (Keeps user on 4-Chart Desk — ZERO Forced Logout!) */}
+          {totpRefreshRequired && (
+            <div
+              data-testid="inline-totp-refresh-bar"
+              className="bg-amber-950/80 border border-amber-500/70 rounded-lg px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs"
+            >
+              <div className="flex items-start sm:items-center gap-2.5 min-w-0">
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5 sm:mt-0" />
+                <div className="leading-snug text-amber-100">
+                  <strong className="text-amber-300 font-semibold">
+                    Kotak Token Quick-Refresh (No Logout):
+                  </strong>{' '}
+                  Phone me Kotak Neo App ya dusri window me login kholne par Kotak pichla API token badal deta hai.{' '}
+                  {canQuickRefreshTotp
+                    ? 'Sirf naya 6-digit TOTP daal kar 2 sec me live order token refresh karein:'
+                    : 'Server restart hone ke kaaran ek baar Logout daba kar full login karein.'}
+                </div>
+              </div>
+
+              {canQuickRefreshTotp ? (
+                <form
+                  onSubmit={(e) => void handleQuickTotpRefresh(e)}
+                  className="flex items-center gap-2 shrink-0"
+                >
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    autoComplete="one-time-code"
+                    value={quickTotpCode}
+                    onChange={(e) => setQuickTotpCode(e.target.value.replace(/\D/g, ''))}
+                    placeholder="6-digit TOTP"
+                    aria-label="Quick 6-digit Authenticator TOTP"
+                    className="w-32 bg-slate-950 border border-amber-400/70 focus:border-emerald-400 focus:outline-none rounded-md px-2.5 py-1.5 font-mono text-xs tracking-widest text-white placeholder:text-slate-500 placeholder:tracking-normal"
+                    required
+                  />
+                  <button
+                    type="submit"
+                    disabled={quickTotpSubmitting || quickTotpCode.length !== 6}
+                    className="px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-semibold whitespace-nowrap transition-colors"
+                  >
+                    {quickTotpSubmitting ? 'Refreshing...' : 'Refresh Token (2s)'}
+                  </button>
+                </form>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void handleDisconnectKotakLive()}
+                  className="px-3 py-1.5 rounded-md bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold whitespace-nowrap transition-colors"
+                >
+                  Open Full Login
+                </button>
+              )}
+            </div>
+          )}
 
           {/* =============================================================== */}
           {/* VIEW 1: 4-CHART HOME DESK (30M, 5M, 1M, 30S)                    */}

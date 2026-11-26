@@ -150,11 +150,9 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
             <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
             <div className="leading-relaxed">
               <strong className="text-amber-300 font-semibold">
-                Kotak Daily Session Expired:
+                Kotak Live Token Notice:
               </strong>{' '}
-              Kotak Securities har raat purana session token invalidate kar deta hai. Abhi naya{' '}
-              <strong className="text-white">6-digit TOTP</strong> daal kar 5 second me reconnect karein — ya niche{' '}
-              <strong className="text-emerald-300">Optional 24×7 Auto-TOTP Secret Key</strong> bhar dein taaki roz subah 9:00 AM se pehle server khud auto-login kar liya kare!
+              Ek baar login karne ke baad dashboard kabhi auto-logout nahi hoga — agar Kotak Neo Phone App kholne par token rotate ho jaye to dashboard ke andar hi 1-box <strong className="text-white">6-digit TOTP Refresh</strong> mil jayega!
             </div>
           </div>
         )}
