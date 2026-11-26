@@ -548,10 +548,10 @@ export const STRATEGY_CATALOG: {
       bollingerPeriod: 18,
       bollingerStdDev: 1.9,
       adxPeriod: 14,
-      adxThreshold: 20,
-      useAdxFilter: true,
+      adxThreshold: 14,
+      useAdxFilter: false,
       useSessionFilter: false,
-      useHigherTimeframeTrend: true,
+      useHigherTimeframeTrend: false,
     },
   },
   {
@@ -604,10 +604,10 @@ export const STRATEGY_CATALOG: {
       bollingerPeriod: 16,
       bollingerStdDev: 1.8,
       adxPeriod: 10,
-      adxThreshold: 17,
-      useAdxFilter: true,
+      adxThreshold: 13,
+      useAdxFilter: false,
       useSessionFilter: false,
-      useHigherTimeframeTrend: true,
+      useHigherTimeframeTrend: false,
     },
   },
 ];
@@ -1070,20 +1070,28 @@ export function detectMarketPatternAndAdaptIndicators(
       (m) => m.symbol === symbol && m.timeframe === timeframe && m.regime === regime
     );
     if (exactMatch) {
+      const safeVaultCfg: IndicatorConfig =
+        regime === 'BREAKOUT_SQUEEZE' || regime === 'MEAN_REVERTING_RANGE' || regime === 'HIGH_VELOCITY_SCALP'
+          ? { ...exactMatch.indicatorConfig, useAdxFilter: false }
+          : { ...exactMatch.indicatorConfig };
       return {
         regime,
         patternLabel: `${patternLabel} · Learned`,
         strategy: exactMatch.strategy,
-        indicatorConfig: { ...exactMatch.indicatorConfig },
+        indicatorConfig: safeVaultCfg,
       };
     }
     const regimeMatch = memoryVault.find((m) => m.symbol === symbol && m.regime === regime);
     if (regimeMatch) {
+      const safeVaultCfg: IndicatorConfig =
+        regime === 'BREAKOUT_SQUEEZE' || regime === 'MEAN_REVERTING_RANGE' || regime === 'HIGH_VELOCITY_SCALP'
+          ? { ...regimeMatch.indicatorConfig, useAdxFilter: false }
+          : { ...regimeMatch.indicatorConfig };
       return {
         regime,
         patternLabel: `${patternLabel} · Vault`,
         strategy: regimeMatch.strategy,
-        indicatorConfig: { ...regimeMatch.indicatorConfig },
+        indicatorConfig: safeVaultCfg,
       };
     }
   }
@@ -1092,15 +1100,48 @@ export function detectMarketPatternAndAdaptIndicators(
     STRATEGY_CATALOG.find((s) => s.id === strategy)?.defaultRawConfig ??
     STRATEGY_CATALOG[0].defaultRawConfig;
 
+  const disableAdx =
+    regime === 'BREAKOUT_SQUEEZE' ||
+    regime === 'MEAN_REVERTING_RANGE' ||
+    regime === 'HIGH_VELOCITY_SCALP';
+
   // Dynamic timeframe-aware indicator calibration
   const adapted: IndicatorConfig =
     timeframe === '30M'
-      ? { ...basePreset, fastEmaPeriod: 12, slowEmaPeriod: 34, atrMultiplierSL: 1.6, atrMultiplierTP: 3.0 }
+      ? {
+          ...basePreset,
+          useAdxFilter: disableAdx ? false : basePreset.useAdxFilter,
+          fastEmaPeriod: 12,
+          slowEmaPeriod: 34,
+          atrMultiplierSL: 1.6,
+          atrMultiplierTP: 3.0,
+        }
       : timeframe === '5M'
-      ? { ...basePreset, fastEmaPeriod: 9, slowEmaPeriod: 24, atrMultiplierSL: 1.4, atrMultiplierTP: 2.5 }
+      ? {
+          ...basePreset,
+          useAdxFilter: disableAdx ? false : basePreset.useAdxFilter,
+          fastEmaPeriod: 9,
+          slowEmaPeriod: 24,
+          atrMultiplierSL: 1.4,
+          atrMultiplierTP: 2.5,
+        }
       : timeframe === '1M'
-      ? { ...basePreset, fastEmaPeriod: 7, slowEmaPeriod: 18, atrMultiplierSL: 1.3, atrMultiplierTP: 2.2 }
-      : { ...basePreset, fastEmaPeriod: 5, slowEmaPeriod: 13, atrMultiplierSL: 1.2, atrMultiplierTP: 1.9 };
+      ? {
+          ...basePreset,
+          useAdxFilter: disableAdx ? false : basePreset.useAdxFilter,
+          fastEmaPeriod: 7,
+          slowEmaPeriod: 18,
+          atrMultiplierSL: 1.3,
+          atrMultiplierTP: 2.2,
+        }
+      : {
+          ...basePreset,
+          useAdxFilter: false,
+          fastEmaPeriod: 5,
+          slowEmaPeriod: 13,
+          atrMultiplierSL: 1.2,
+          atrMultiplierTP: 1.9,
+        };
 
   return {
     regime,
@@ -1160,39 +1201,39 @@ export function evaluateMultiTimeframeConfluence(
       summary: `${sellCount}/4 Timeframes Bearish Confluence (${sellScore}% weight)`,
     };
   }
-  // If 30S + 1M or 5M fire fast trigger in absence of higher conflict
-  if (buyCount >= 2 && sellCount === 0) {
+  // If 2+ timeframes align in absence of higher conflict (or dominating minor 30S noise)
+  if (buyCount >= 2 && sellScore <= 15 && buyScore > sellScore) {
     return {
       direction: 'BUY',
-      confidencePct: Math.max(58, buyScore),
+      confidencePct: Math.max(58, buyScore + 8),
       alignedCount: buyCount,
-      summary: `${buyCount}/4 Micro Timeframes Bullish`,
+      summary: `${buyCount}/4 Timeframes Bullish (${buyScore}% weight)`,
     };
   }
-  if (sellCount >= 2 && buyCount === 0) {
+  if (sellCount >= 2 && buyScore <= 15 && sellScore > buyScore) {
     return {
       direction: 'SELL',
-      confidencePct: Math.max(58, sellScore),
+      confidencePct: Math.max(58, sellScore + 8),
       alignedCount: sellCount,
-      summary: `${sellCount}/4 Micro Timeframes Bearish`,
+      summary: `${sellCount}/4 Timeframes Bearish (${sellScore}% weight)`,
     };
   }
 
-  // Fast 1M or 30S scalp trigger when zero opposing signals exist across higher timeframes (ideal for High-Risk Currency Mode)
-  if (buyCount >= 1 && sellCount === 0 && (slots['1M'].liveSignal === 'BUY' || slots['30S'].liveSignal === 'BUY')) {
+  // Fast single-timeframe trigger when zero opposing signals exist across all other timeframes
+  if (buyCount >= 1 && sellCount === 0) {
     return {
       direction: 'BUY',
-      confidencePct: Math.max(54, buyScore + 28),
+      confidencePct: Math.max(54, buyScore + 26),
       alignedCount: buyCount,
-      summary: `Fast ${slots['1M'].liveSignal === 'BUY' ? '1M' : '30S'} Bullish Scalp Trigger (0HTF Conflict)`,
+      summary: `Active Bullish Setup (${buyScore}% TF weight · 0 Conflict)`,
     };
   }
-  if (sellCount >= 1 && buyCount === 0 && (slots['1M'].liveSignal === 'SELL' || slots['30S'].liveSignal === 'SELL')) {
+  if (sellCount >= 1 && buyCount === 0) {
     return {
       direction: 'SELL',
-      confidencePct: Math.max(54, sellScore + 28),
+      confidencePct: Math.max(54, sellScore + 26),
       alignedCount: sellCount,
-      summary: `Fast ${slots['1M'].liveSignal === 'SELL' ? '1M' : '30S'} Bearish Scalp Trigger (0HTF Conflict)`,
+      summary: `Active Bearish Setup (${sellScore}% TF weight · 0 Conflict)`,
     };
   }
 
@@ -1229,10 +1270,12 @@ function evaluateSignalAtIndex(
   const bbLower = c.bbLower ?? c.low;
   const bbMiddle = c.bbMiddle ?? c.close;
 
-  const lookbackCandle = candles[Math.max(0, i - 12)];
+  const lookbackCandle = candles[Math.max(0, i - 10)];
   const htfSlowEma = lookbackCandle.slowEma ?? lookbackCandle.close;
-  const htfBullish = slowEma > htfSlowEma && fastEma > slowEma && c.close > slowEma;
-  const htfBearish = slowEma < htfSlowEma && fastEma < slowEma && c.close < slowEma;
+  const htfBullish =
+    fastEma >= slowEma && c.close >= slowEma && slowEma >= htfSlowEma - atr * 0.15;
+  const htfBearish =
+    fastEma <= slowEma && c.close <= slowEma && slowEma <= htfSlowEma + atr * 0.15;
 
   const netMove10 = Math.abs(c.close - candles[Math.max(0, i - 10)].close);
   let pathMove10 = 0;
@@ -1240,7 +1283,8 @@ function evaluateSignalAtIndex(
     pathMove10 += Math.abs(candles[k].close - candles[k - 1].close);
   }
   const efficiencyRatio = pathMove10 > 0 ? netMove10 / pathMove10 : 0;
-  const isTrending = efficiencyRatio >= 0.22 && adxVal >= indicatorConfig.adxThreshold;
+  const effectiveAdxThreshold = Math.min(indicatorConfig.adxThreshold, 17);
+  const isTrending = efficiencyRatio >= 0.2 && adxVal >= effectiveAdxThreshold;
 
   const marketRegime: BacktestTrade['marketRegime'] = isTrending
     ? 'TRENDING'
@@ -1249,7 +1293,10 @@ function evaluateSignalAtIndex(
     : 'RANGING_CHOP';
 
   const sessionPass = !indicatorConfig.useSessionFilter || inNseSession;
-  const adxPass = !indicatorConfig.useAdxFilter || adxVal >= indicatorConfig.adxThreshold;
+  // Never deadlock breakout squeezes, mean-reversion ranges, or 30S scalps on ADX!
+  const requiresAdxGate =
+    strategy === 'EMA_RSI_CONFLUENCE' && indicatorConfig.useAdxFilter;
+  const adxPass = !requiresAdxGate || adxVal >= effectiveAdxThreshold;
 
   if (!sessionPass || !adxPass) {
     return { signal: null, marketRegime, atr };
@@ -1260,73 +1307,96 @@ function evaluateSignalAtIndex(
   const trendSellOk = !indicatorConfig.useHigherTimeframeTrend || htfBearish;
 
   if (strategy === 'EMA_RSI_CONFLUENCE') {
-    const bullishCross = fastEma > slowEma && prevFastEma <= prevSlowEma && c.close > c.open;
+    const bullishCross = fastEma > slowEma && prevFastEma <= prevSlowEma && c.close >= c.open;
     const bullishPullback =
       fastEma > slowEma &&
-      c.close > slowEma &&
-      prev.low <= prevFastEma &&
-      c.close > fastEma &&
-      c.close > prev.high &&
-      rsi > prevRsi &&
+      c.close >= fastEma &&
+      (prev.low <= prevFastEma + atr * 0.25 || c.low <= fastEma + atr * 0.2) &&
+      c.close >= prev.close &&
       rsi >= indicatorConfig.rsiOversold &&
-      rsi <= 65;
+      rsi <= 70;
+    const bullishContinuation =
+      fastEma > slowEma &&
+      c.close > fastEma &&
+      prev.close >= prevFastEma &&
+      c.close >= c.open &&
+      rsi >= 52 &&
+      rsi <= 70 &&
+      rsi >= prevRsi - 1.5;
 
-    const bearishCross = fastEma < slowEma && prevFastEma >= prevSlowEma && c.close < c.open;
+    const bearishCross = fastEma < slowEma && prevFastEma >= prevSlowEma && c.close <= c.open;
     const bearishPullback =
       fastEma < slowEma &&
-      c.close < slowEma &&
-      prev.high >= prevFastEma &&
-      c.close < fastEma &&
-      c.close < prev.low &&
-      rsi < prevRsi &&
+      c.close <= fastEma &&
+      (prev.high >= prevFastEma - atr * 0.25 || c.high >= fastEma - atr * 0.2) &&
+      c.close <= prev.close &&
       rsi <= indicatorConfig.rsiOverbought &&
-      rsi >= 35;
+      rsi >= 30;
+    const bearishContinuation =
+      fastEma < slowEma &&
+      c.close < fastEma &&
+      prev.close <= prevFastEma &&
+      c.close <= c.open &&
+      rsi <= 48 &&
+      rsi >= 30 &&
+      rsi <= prevRsi + 1.5;
 
-    if (trendBuyOk && (bullishCross || bullishPullback)) signal = 'BUY';
-    else if (trendSellOk && (bearishCross || bearishPullback)) signal = 'SELL';
+    if (trendBuyOk && (bullishCross || bullishPullback || bullishContinuation)) signal = 'BUY';
+    else if (trendSellOk && (bearishCross || bearishPullback || bearishContinuation)) signal = 'SELL';
   } else if (strategy === 'SMART_MONEY_BREAKOUT') {
-    const lookbackN = indicatorConfig.useHigherTimeframeTrend ? 18 : 6;
+    const lookbackN = indicatorConfig.useHigherTimeframeTrend ? 10 : 6;
     let recentHigh = -Infinity;
     let recentLow = Infinity;
     for (let k = Math.max(0, i - lookbackN); k < i; k++) {
       if (candles[k].high > recentHigh) recentHigh = candles[k].high;
       if (candles[k].low < recentLow) recentLow = candles[k].low;
     }
-    if (trendBuyOk && c.close > recentHigh && c.close > c.open) signal = 'BUY';
-    else if (trendSellOk && c.close < recentLow && c.close < c.open) signal = 'SELL';
+    const squeezeBull =
+      (c.close >= recentHigh && c.close >= c.open) ||
+      (fastEma > slowEma &&
+        c.close > bbMiddle &&
+        c.close >= fastEma &&
+        c.close >= prev.high &&
+        rsi >= 52);
+    const squeezeBear =
+      (c.close <= recentLow && c.close <= c.open) ||
+      (fastEma < slowEma &&
+        c.close < bbMiddle &&
+        c.close <= fastEma &&
+        c.close <= prev.low &&
+        rsi <= 48);
+
+    if (trendBuyOk && squeezeBull) signal = 'BUY';
+    else if (trendSellOk && squeezeBear) signal = 'SELL';
   } else if (strategy === 'BOLLINGER_MEAN_REVERSION') {
     const oversoldReversal =
-      (prev.low <= bbLower || c.low <= bbLower) &&
-      rsi <= indicatorConfig.rsiOversold + 5 &&
-      c.close > c.open &&
-      c.close > prev.close &&
-      c.close < bbMiddle;
+      (prev.low <= bbLower + atr * 0.2 || c.low <= bbLower + atr * 0.2) &&
+      rsi <= indicatorConfig.rsiOversold + 8 &&
+      c.close >= c.open &&
+      c.close >= prev.close;
     const overboughtReversal =
-      (prev.high >= bbUpper || c.high >= bbUpper) &&
-      rsi >= indicatorConfig.rsiOverbought - 5 &&
-      c.close < c.open &&
-      c.close < prev.close &&
-      c.close > bbMiddle;
+      (prev.high >= bbUpper - atr * 0.2 || c.high >= bbUpper - atr * 0.2) &&
+      rsi >= indicatorConfig.rsiOverbought - 8 &&
+      c.close <= c.open &&
+      c.close <= prev.close;
 
     if (oversoldReversal) signal = 'BUY';
     else if (overboughtReversal) signal = 'SELL';
   } else if (strategy === 'SCALPER_30S_MOMENTUM') {
     const momBuy =
       fastEma > slowEma &&
-      c.close > fastEma &&
-      c.close >= prev.high &&
-      c.close > c.open &&
-      rsi >= 44 &&
-      rsi <= 68 &&
-      rsi >= prevRsi;
+      c.close >= fastEma &&
+      c.close >= prev.close &&
+      c.close >= c.open &&
+      rsi >= 48 &&
+      rsi <= 74;
     const momSell =
       fastEma < slowEma &&
-      c.close < fastEma &&
-      c.close <= prev.low &&
-      c.close < c.open &&
-      rsi <= 56 &&
-      rsi >= 32 &&
-      rsi <= prevRsi;
+      c.close <= fastEma &&
+      c.close <= prev.close &&
+      c.close <= c.open &&
+      rsi <= 52 &&
+      rsi >= 26;
 
     if (trendBuyOk && momBuy) signal = 'BUY';
     else if (trendSellOk && momSell) signal = 'SELL';
@@ -1409,8 +1479,24 @@ export function evaluateLiveSignal(
   if (candles.length < 30) {
     return { signal: null, atr: INDIAN_SYMBOLS[symbol].tickSize * 14 };
   }
-  const res = evaluateSignalAtIndex(candles, candles.length - 1, symbol, strategy, indicatorConfig);
-  return { signal: res.signal, atr: res.atr };
+  const resNow = evaluateSignalAtIndex(candles, candles.length - 1, symbol, strategy, indicatorConfig);
+  if (resNow.signal !== null || candles.length < 31) {
+    return { signal: resNow.signal, atr: resNow.atr };
+  }
+  // When a brand-new bar just opened and hasn't broken out yet, carry forward the just-closed bar's signal
+  // as long as price hasn't invalidated fastEma!
+  const resPrev = evaluateSignalAtIndex(candles, candles.length - 2, symbol, strategy, indicatorConfig);
+  if (resPrev.signal !== null) {
+    const last = candles[candles.length - 1];
+    const fast = last.fastEma ?? last.close;
+    if (
+      (resPrev.signal === 'BUY' && last.close >= fast - resNow.atr * 0.25) ||
+      (resPrev.signal === 'SELL' && last.close <= fast + resNow.atr * 0.25)
+    ) {
+      return { signal: resPrev.signal, atr: resNow.atr };
+    }
+  }
+  return { signal: null, atr: resNow.atr };
 }
 
 export function runBacktestOnCandles(

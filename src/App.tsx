@@ -117,6 +117,7 @@ export default function App() {
   // Kotak Neo LIVE Authentication, AI Memory Vault, Risk & Orders (Zero Paper Simulator)
   const [authChecked, setAuthChecked] = useState<boolean>(false);
   const [lastUcc, setLastUcc] = useState<string>('');
+  const [sessionExpiredReason, setSessionExpiredReason] = useState<string | null>(null);
   const [liveAccount, setLiveAccount] = useState<KotakAccountProfile>({
     id: 'kotak-live-unlinked',
     label: 'Kotak Neo Live API Account',
@@ -336,6 +337,11 @@ export default function App() {
         if (typeof data.lastUcc === 'string') {
           setLastUcc(data.lastUcc);
         }
+        if (typeof data.sessionExpiredReason === 'string' && data.sessionExpiredReason) {
+          setSessionExpiredReason(data.sessionExpiredReason);
+        } else {
+          setSessionExpiredReason(null);
+        }
         if (data.accounts?.LIVE) {
           setLiveAccount(data.accounts.LIVE);
           if (
@@ -487,6 +493,11 @@ export default function App() {
         .then((r) => (r.ok ? r.json() : null))
         .then((data) => {
           if (!data) return;
+          if (typeof data.sessionExpiredReason === 'string' && data.sessionExpiredReason) {
+            setSessionExpiredReason(data.sessionExpiredReason);
+          } else if (data.sessionExpiredReason === null) {
+            setSessionExpiredReason(null);
+          }
           if (data.accounts?.LIVE) {
             setLiveAccount(data.accounts.LIVE);
           }
@@ -723,6 +734,17 @@ export default function App() {
       })
         .then(async (r) => {
           const data = await r.json().catch(() => ({}));
+          if (r.status === 401) {
+            setSessionExpiredReason(
+              data?.error ||
+                'Kotak Daily Session Token expire ho gaya hai — naye 6-digit TOTP se Re-Login karein!'
+            );
+            setLiveAccount((prev) => ({
+              ...prev,
+              connected: false,
+              sessionState: 'DISCONNECTED',
+            }));
+          }
           if (!r.ok || !data?.trade?.exchangeVerified) {
             throw new Error(
               data?.error || 'Kotak Exchange par order execute nahi hua (Order Book check karein)'
@@ -1420,6 +1442,7 @@ export default function App() {
     mobile: string;
     consumerKey: string;
     totp: string;
+    totpSecret?: string;
     mpin: string;
     exchangeSegment: 'NSE_CDS' | 'NSE_FO' | 'MCX_FO';
     brokerageTier: RiskConfig['brokerageTier'];
@@ -1434,6 +1457,7 @@ export default function App() {
       const data = await resp.json();
       if (!resp.ok) return data.error || 'Could not connect Kotak Neo account';
       if (data.account) {
+        setSessionExpiredReason(null);
         setLastUcc(data.account.ucc || payload.ucc);
         setLiveAccount(data.account);
         if (data.kotakContracts && typeof data.kotakContracts === 'object') {
@@ -1476,6 +1500,17 @@ export default function App() {
     try {
       const resp = await fetch('/api/kotak/refresh-limits', { method: 'POST' });
       const data = await resp.json().catch(() => ({}));
+      if (resp.status === 401) {
+        setSessionExpiredReason(
+          data?.error ||
+            'Kotak Daily Session Token expire ho gaya hai — naye 6-digit TOTP se Re-Login karein!'
+        );
+        setLiveAccount((prev) => ({
+          ...prev,
+          connected: false,
+          sessionState: 'DISCONNECTED',
+        }));
+      }
       if (!resp.ok) return data.error || 'Unable to sync Kotak Neo margin';
       if (data.account) {
         setLiveAccount(data.account);
@@ -1610,6 +1645,7 @@ export default function App() {
     return (
       <KotakLoginGate
         lastUcc={lastUcc}
+        sessionExpiredReason={sessionExpiredReason}
         oracleDb={oracleDb}
         defaultExchangeSegment={liveAccount.exchangeSegment}
         defaultBrokerageTier={liveAccount.brokerageTier}

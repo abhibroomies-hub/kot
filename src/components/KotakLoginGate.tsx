@@ -14,6 +14,7 @@ import { DeployGuideModal } from './DeployGuideModal';
 
 interface KotakLoginGateProps {
   lastUcc: string;
+  sessionExpiredReason?: string | null;
   oracleDb?: OracleDbStatusInfo | null;
   defaultExchangeSegment: 'NSE_CDS' | 'NSE_FO' | 'MCX_FO';
   defaultBrokerageTier: RiskConfig['brokerageTier'];
@@ -23,6 +24,7 @@ interface KotakLoginGateProps {
     mobile: string;
     consumerKey: string;
     totp: string;
+    totpSecret?: string;
     mpin: string;
     exchangeSegment: 'NSE_CDS' | 'NSE_FO' | 'MCX_FO';
     brokerageTier: RiskConfig['brokerageTier'];
@@ -32,6 +34,7 @@ interface KotakLoginGateProps {
 
 export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
   lastUcc,
+  sessionExpiredReason,
   oracleDb,
   defaultExchangeSegment,
   defaultBrokerageTier,
@@ -42,6 +45,7 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
   const [mobile, setMobile] = useState('');
   const [consumerKey, setConsumerKey] = useState('');
   const [totp, setTotp] = useState('');
+  const [totpSecret, setTotpSecret] = useState('');
   const [mpin, setMpin] = useState('');
   const [exchangeSegment, setExchangeSegment] = useState<'NSE_CDS' | 'NSE_FO' | 'MCX_FO'>(
     defaultExchangeSegment
@@ -68,6 +72,7 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
       mobile: mobile.trim(),
       consumerKey: consumerKey.trim(),
       totp: totp.trim(),
+      totpSecret: totpSecret.trim() || undefined,
       mpin: mpin.trim(),
       exchangeSegment,
       brokerageTier,
@@ -79,6 +84,7 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
       setErrorMsg(err);
     } else {
       setTotp('');
+      setTotpSecret('');
       setMpin('');
     }
   };
@@ -134,6 +140,24 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
             </div>
           </div>
         </div>
+
+        {sessionExpiredReason && (
+          <div
+            role="status"
+            data-testid="kotak-session-expired-banner"
+            className="p-3.5 rounded-xl bg-amber-950/75 border border-amber-500/60 text-amber-100 text-xs flex items-start gap-2.5"
+          >
+            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div className="leading-relaxed">
+              <strong className="text-amber-300 font-semibold">
+                Kotak Daily Session Expired:
+              </strong>{' '}
+              Kotak Securities har raat purana session token invalidate kar deta hai. Abhi naya{' '}
+              <strong className="text-white">6-digit TOTP</strong> daal kar 5 second me reconnect karein — ya niche{' '}
+              <strong className="text-emerald-300">Optional 24×7 Auto-TOTP Secret Key</strong> bhar dein taaki roz subah 9:00 AM se pehle server khud auto-login kar liya kare!
+            </div>
+          </div>
+        )}
 
         {/* Main 2-Column Login Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -208,7 +232,7 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
 
               <div>
                 <label htmlFor="gate-kotak-totp" className="block text-slate-300 font-medium mb-1.5">
-                  Live 6-Digit TOTP (Authenticator) *
+                  Live 6-Digit TOTP {totpSecret.trim() ? '(Auto-Generated)' : '*'}
                 </label>
                 <input
                   id="gate-kotak-totp"
@@ -219,9 +243,9 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
                   autoComplete="one-time-code"
                   value={totp}
                   onChange={(e) => setTotp(e.target.value.replace(/\D/g, ''))}
-                  placeholder="6-digit TOTP"
+                  placeholder={totpSecret.trim() ? 'Auto from Secret Key' : '6-digit TOTP'}
                   className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 focus:outline-none rounded-lg px-3 py-2.5 font-mono text-sm tracking-widest text-white placeholder:text-slate-600 placeholder:tracking-normal"
-                  required
+                  required={!totpSecret.trim()}
                 />
               </div>
 
@@ -242,6 +266,26 @@ export const KotakLoginGate: React.FC<KotakLoginGateProps> = ({
                   className="w-full bg-slate-950 border border-slate-700 focus:border-emerald-500 focus:outline-none rounded-lg px-3 py-2.5 font-mono text-sm tracking-widest text-white placeholder:text-slate-600 placeholder:tracking-normal"
                   required
                 />
+              </div>
+
+              <div className="sm:col-span-2">
+                <details className="group rounded-lg bg-slate-950/70 border border-slate-800 px-3 py-2">
+                  <summary className="cursor-pointer text-[11px] text-slate-400 hover:text-emerald-300 font-medium select-none">
+                    Optional Advanced: Permanent QR Setup Key (agar nahi hai to khali chhod dein — sirf upar 6-digit TOTP daalein)
+                  </summary>
+                  <div className="mt-2">
+                    <input
+                      id="gate-kotak-totp-secret"
+                      name="totpSecret"
+                      type="password"
+                      autoComplete="off"
+                      value={totpSecret}
+                      onChange={(e) => setTotpSecret(e.target.value)}
+                      placeholder="Optional: Kotak TOTP QR ke niche wali permanent Base32 Key (30s wala 6-digit code yahan NA daalein)"
+                      className="w-full bg-slate-950 border border-emerald-500/40 focus:border-emerald-400 focus:outline-none rounded-lg px-3 py-2 font-mono text-xs text-white placeholder:text-slate-600"
+                    />
+                  </div>
+                </details>
               </div>
 
               <div>
